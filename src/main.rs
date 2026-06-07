@@ -1,16 +1,16 @@
-// agent-bus — minimal A2A-shaped message broker for coordinating CLI agent sessions.
+// agent-bus — minimal A2A-shaped message bus for coordinating CLI agent sessions.
 //
-// One self-contained binary:
+//   agent-bus                       first-time interactive setup wizard
 //   agent-bus serve                 MCP stdio server (point a CLI's MCP config at this)
-//   agent-bus install [--tool ..]   interactive installer: writes MCP config + CLAUDE.md bootstrap
+//   agent-bus install [--tool ..]   non-interactive installer (flags) / wizard (no flags)
 //   agent-bus send --to X --body Y  CLI client
-//   agent-bus poll [--as alias]     CLI client
-//   agent-bus peers                 CLI client
-//   agent-bus register [--card ..]  CLI client
+//   agent-bus poll  [--as alias] [--team t]
+//   agent-bus peers [--team t|*]
+//   agent-bus register [--card ..]
 //
-// Identity = AGENT_BUS_ALIAS env (or --as for CLI). Shared state in ~/.agent-bus/
-// (override with AGENT_BUS_HOME / AGENT_BUS_DB). A2A-shaped: messages carry a
-// task_id + lifecycle state so the wire can grow into real A2A later.
+// Identity = AGENT_BUS_TEAM/AGENT_BUS_ALIAS (server) or --team/--as (CLI). Teams are a
+// logical namespace over one shared bus (~/.agent-bus/bus.db): same-team is the default
+// scope, cross-team is addressable explicitly. A2A-shaped (task_id + lifecycle state).
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -22,23 +22,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS messages (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id    TEXT,
-    sender     TEXT,
-    recipient  TEXT,
-    type       TEXT,
-    state      TEXT,
-    body       TEXT,
-    created_at INTEGER
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         TEXT,
+    sender_team     TEXT,
+    sender_alias    TEXT,
+    recipient_team  TEXT,
+    recipient_alias TEXT,   -- alias, or '*' for a team/global broadcast
+    type            TEXT,
+    state           TEXT,
+    body            TEXT,
+    created_at      INTEGER
 );
 CREATE TABLE IF NOT EXISTS cursors (
-    alias   TEXT PRIMARY KEY,
-    last_id INTEGER NOT NULL DEFAULT 0
+    team    TEXT,
+    alias   TEXT,
+    last_id INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(team, alias)
 );
 CREATE TABLE IF NOT EXISTS peers (
-    alias     TEXT PRIMARY KEY,
+    team      TEXT,
+    alias     TEXT,
     card      TEXT,
-    last_seen INTEGER
+    last_seen INTEGER,
+    PRIMARY KEY(team, alias)
 );
 ";
 
@@ -47,17 +53,19 @@ fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
 }
 fn bus_home() -> PathBuf {
-    std::env::var("AGENT_BUS_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| home_dir().join(".agent-bus"))
+    std::env::var("AGENT_BUS_HOME").map(PathBuf::from).unwrap_or_else(|_| home_dir().join(".agent-bus"))
 }
 fn db_path() -> PathBuf {
-    std::env::var("AGENT_BUS_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| bus_home().join("bus.db"))
+    std::env::var("AGENT_BUS_DB").map(PathBuf::from).unwrap_or_else(|_| bus_home().join("bus.db"))
 }
 fn inbox_dir() -> PathBuf {
     bus_home().join("inbox")
+}
+fn flag_path(team: &str, alias: &str) -> PathBuf {
+    inbox_dir().join(team).join(format!("{}.flag", alias))
+}
+fn team_env() -> String {
+    std::env::var("AGENT_BUS_TEAM").unwrap_or_else(|_| "default".into())
 }
 fn alias_env() -> String {
     std::env::var("AGENT_BUS_ALIAS").unwrap_or_else(|_| "unknown".into())
@@ -67,7 +75,7 @@ fn now_ms() -> i64 {
 }
 fn short_id() -> String {
     let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
-    format!("{:08x}", (n.wrapping_mul(2654435761)) as u32)
+    format!("{:08x}", n.wrapping_mul(2654435761) as u32)
 }
 
 // ---------------------------------------------------------------- storage
@@ -83,55 +91,86 @@ fn open_db() -> Connection {
     conn
 }
 
-fn mark_seen(conn: &Connection, alias: &str) -> rusqlite::Result<()> {
+fn mark_seen(conn: &Connection, team: &str, alias: &str) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO peers(alias, last_seen) VALUES(?1, ?2) \
-         ON CONFLICT(alias) DO UPDATE SET last_seen=?2",
-        params![alias, now_ms()],
+        "INSERT INTO peers(team, alias, last_seen) VALUES(?1, ?2, ?3) \
+         ON CONFLICT(team, alias) DO UPDATE SET last_seen=?3",
+        params![team, alias, now_ms()],
     )?;
     Ok(())
 }
 
-fn touch_doorbell(conn: &Connection, to: &str, self_alias: &str) {
-    let targets: Vec<String> = if to == "all" {
+// recipient addressing: `to` -> (recipient_team, recipient_alias)
+//   "all"          -> (my_team, "*")     team broadcast
+//   "*"|"everyone" -> ("*", "*")         global broadcast
+//   "team:NAME"    -> (NAME, "*")        named-team broadcast
+//   "team/alias"   -> (team, alias)      cross-team direct
+//   "alias"        -> (my_team, alias)   same-team direct
+fn resolve_to(to: &str, my_team: &str) -> (String, String) {
+    if to == "all" {
+        (my_team.to_string(), "*".into())
+    } else if to == "*" || to == "everyone" {
+        ("*".into(), "*".into())
+    } else if let Some(t) = to.strip_prefix("team:") {
+        (t.to_string(), "*".into())
+    } else if let Some((t, a)) = to.split_once('/') {
+        (t.to_string(), a.to_string())
+    } else {
+        (my_team.to_string(), to.to_string())
+    }
+}
+
+fn touch_doorbell(conn: &Connection, rt: &str, ra: &str, my_team: &str, my_alias: &str) {
+    let targets: Vec<(String, String)> = if ra == "*" {
+        let (sql, p): (&str, Vec<String>) = if rt == "*" {
+            ("SELECT team, alias FROM peers", vec![])
+        } else {
+            ("SELECT team, alias FROM peers WHERE team=?1", vec![rt.to_string()])
+        };
         let mut v = vec![];
-        if let Ok(mut s) = conn.prepare("SELECT alias FROM peers") {
-            if let Ok(rows) = s.query_map([], |r| r.get::<_, String>(0)) {
-                for a in rows.flatten() {
-                    v.push(a);
+        if let Ok(mut s) = conn.prepare(sql) {
+            let rows = s.query_map(rusqlite::params_from_iter(p.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            });
+            if let Ok(rows) = rows {
+                for t in rows.flatten() {
+                    v.push(t);
                 }
             }
         }
         v
     } else {
-        vec![to.to_string()]
+        vec![(rt.to_string(), ra.to_string())]
     };
-    let dir = inbox_dir();
-    fs::create_dir_all(&dir).ok();
-    for t in targets {
-        if t == self_alias {
+    for (t, a) in targets {
+        if t == my_team && a == my_alias {
             continue;
         }
-        let _ = fs::write(dir.join(format!("{}.flag", t)), now_ms().to_string());
+        let fp = flag_path(&t, &a);
+        if let Some(parent) = fp.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        let _ = fs::write(fp, now_ms().to_string());
     }
 }
 
 // ---------------------------------------------------------------- tools
-fn tool_register(conn: &Connection, alias: &str, args: &Value) -> rusqlite::Result<Value> {
+fn tool_register(conn: &Connection, team: &str, alias: &str, args: &Value) -> rusqlite::Result<Value> {
     let card = args["card"].as_str();
     conn.execute(
-        "INSERT INTO peers(alias, card, last_seen) VALUES(?1, ?2, ?3) \
-         ON CONFLICT(alias) DO UPDATE SET card=COALESCE(?2, peers.card), last_seen=?3",
-        params![alias, card, now_ms()],
+        "INSERT INTO peers(team, alias, card, last_seen) VALUES(?1, ?2, ?3, ?4) \
+         ON CONFLICT(team, alias) DO UPDATE SET card=COALESCE(?3, peers.card), last_seen=?4",
+        params![team, alias, card, now_ms()],
     )?;
-    Ok(json!({"ok": true, "alias": alias}))
+    Ok(json!({"ok": true, "team": team, "alias": alias, "id": format!("{}/{}", team, alias)}))
 }
 
-fn tool_send(conn: &Connection, alias: &str, args: &Value) -> rusqlite::Result<Value> {
+fn tool_send(conn: &Connection, team: &str, alias: &str, args: &Value) -> rusqlite::Result<Value> {
     let to = match args["to"].as_str() {
         Some(s) => s,
         None => return Ok(json!({"ok": false, "error": "missing 'to'"})),
     };
+    let (rt, ra) = resolve_to(to, team);
     let body = args["body"].as_str().unwrap_or("");
     let mtype = args["type"].as_str().unwrap_or("message");
     let state = args["state"].as_str().map(|s| s.to_string()).unwrap_or_else(|| {
@@ -139,72 +178,88 @@ fn tool_send(conn: &Connection, alias: &str, args: &Value) -> rusqlite::Result<V
     });
     let task_id = args["task_id"].as_str().map(|s| s.to_string()).unwrap_or_else(short_id);
     conn.execute(
-        "INSERT INTO messages(task_id, sender, recipient, type, state, body, created_at) \
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![task_id, alias, to, mtype, state, body, now_ms()],
+        "INSERT INTO messages(task_id, sender_team, sender_alias, recipient_team, recipient_alias, type, state, body, created_at) \
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![task_id, team, alias, rt, ra, mtype, state, body, now_ms()],
     )?;
     let id = conn.last_insert_rowid();
-    mark_seen(conn, alias)?;
-    touch_doorbell(conn, to, alias);
-    Ok(json!({"ok": true, "id": id, "task_id": task_id}))
+    mark_seen(conn, team, alias)?;
+    touch_doorbell(conn, &rt, &ra, team, alias);
+    Ok(json!({"ok": true, "id": id, "task_id": task_id, "to": format!("{}/{}", rt, ra)}))
 }
 
-fn tool_poll(conn: &Connection, alias: &str) -> rusqlite::Result<Value> {
-    mark_seen(conn, alias)?;
+fn tool_poll(conn: &Connection, team: &str, alias: &str) -> rusqlite::Result<Value> {
+    mark_seen(conn, team, alias)?;
     let last: i64 = conn
-        .query_row("SELECT last_id FROM cursors WHERE alias=?1", params![alias], |r| r.get(0))
+        .query_row("SELECT last_id FROM cursors WHERE team=?1 AND alias=?2", params![team, alias], |r| r.get(0))
         .optional()?
         .unwrap_or(0);
     let mut stmt = conn.prepare(
-        "SELECT id, task_id, sender, recipient, type, state, body, created_at \
-         FROM messages WHERE id>?1 AND (recipient=?2 OR recipient='all') ORDER BY id",
+        "SELECT id, task_id, sender_team, sender_alias, recipient_team, recipient_alias, type, state, body, created_at \
+         FROM messages WHERE id>?1 AND ( \
+           (recipient_team=?2 AND (recipient_alias=?3 OR recipient_alias='*')) \
+           OR (recipient_team='*' AND recipient_alias='*') ) ORDER BY id",
     )?;
     let msgs: Vec<Value> = stmt
-        .query_map(params![last, alias], |r| {
+        .query_map(params![last, team, alias], |r| {
+            let st = r.get::<_, String>(2)?;
+            let sa = r.get::<_, String>(3)?;
+            let rt = r.get::<_, String>(4)?;
+            let ra = r.get::<_, String>(5)?;
             Ok(json!({
                 "id": r.get::<_, i64>(0)?,
                 "task_id": r.get::<_, String>(1)?,
-                "from": r.get::<_, String>(2)?,
-                "to": r.get::<_, String>(3)?,
-                "type": r.get::<_, String>(4)?,
-                "state": r.get::<_, String>(5)?,
-                "body": r.get::<_, String>(6)?,
-                "at": r.get::<_, i64>(7)?,
+                "from": format!("{}/{}", st, sa),
+                "to": format!("{}/{}", rt, ra),
+                "type": r.get::<_, String>(6)?,
+                "state": r.get::<_, String>(7)?,
+                "body": r.get::<_, String>(8)?,
+                "at": r.get::<_, i64>(9)?,
             }))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if let Some(lastmsg) = msgs.last() {
         let newlast = lastmsg["id"].as_i64().unwrap();
         conn.execute(
-            "INSERT INTO cursors(alias, last_id) VALUES(?1, ?2) \
-             ON CONFLICT(alias) DO UPDATE SET last_id=?2",
-            params![alias, newlast],
+            "INSERT INTO cursors(team, alias, last_id) VALUES(?1, ?2, ?3) \
+             ON CONFLICT(team, alias) DO UPDATE SET last_id=?3",
+            params![team, alias, newlast],
         )?;
-        let _ = fs::remove_file(inbox_dir().join(format!("{}.flag", alias)));
+        let _ = fs::remove_file(flag_path(team, alias));
     }
     Ok(json!({"ok": true, "count": msgs.len(), "messages": msgs}))
 }
 
-fn tool_peers(conn: &Connection) -> rusqlite::Result<Value> {
-    let mut stmt = conn.prepare("SELECT alias, card, last_seen FROM peers ORDER BY alias")?;
+fn tool_peers(conn: &Connection, my_team: &str, args: &Value) -> rusqlite::Result<Value> {
+    let filter = args["team"].as_str().unwrap_or(my_team);
+    let (sql, p): (&str, Vec<String>) = if filter == "*" {
+        ("SELECT team, alias, card, last_seen FROM peers ORDER BY team, alias", vec![])
+    } else {
+        ("SELECT team, alias, card, last_seen FROM peers WHERE team=?1 ORDER BY alias", vec![filter.to_string()])
+    };
+    let mut stmt = conn.prepare(sql)?;
     let peers: Vec<Value> = stmt
-        .query_map([], |r| {
+        .query_map(rusqlite::params_from_iter(p.iter()), |r| {
+            let t = r.get::<_, String>(0)?;
+            let a = r.get::<_, String>(1)?;
             Ok(json!({
-                "alias": r.get::<_, String>(0)?,
-                "card": r.get::<_, Option<String>>(1)?,
-                "last_seen": r.get::<_, i64>(2)?,
+                "id": format!("{}/{}", t, a),
+                "team": t,
+                "alias": a,
+                "card": r.get::<_, Option<String>>(2)?,
+                "last_seen": r.get::<_, i64>(3)?,
             }))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(json!({"ok": true, "peers": peers}))
+    Ok(json!({"ok": true, "scope": filter, "peers": peers}))
 }
 
-fn call_tool(conn: &Connection, alias: &str, name: &str, args: &Value) -> Value {
+fn call_tool(conn: &Connection, team: &str, alias: &str, name: &str, args: &Value) -> Value {
     let r = match name {
-        "register" => tool_register(conn, alias, args),
-        "send" => tool_send(conn, alias, args),
-        "poll" => tool_poll(conn, alias),
-        "peers" => tool_peers(conn),
+        "register" => tool_register(conn, team, alias, args),
+        "send" => tool_send(conn, team, alias, args),
+        "poll" => tool_poll(conn, team, alias),
+        "peers" => tool_peers(conn, team, args),
         _ => return json!({"ok": false, "error": format!("unknown tool: {}", name)}),
     };
     match r {
@@ -215,25 +270,25 @@ fn call_tool(conn: &Connection, alias: &str, name: &str, args: &Value) -> Value 
 
 fn tools_list() -> Value {
     json!([
-        {"name":"register","description":"Register/refresh THIS agent (alias from AGENT_BUS_ALIAS) in the bus. Call once at session start.",
+        {"name":"register","description":"Register/refresh THIS agent (team+alias from env) in the bus. Call once at session start.",
          "inputSchema":{"type":"object","properties":{"card":{"type":"string","description":"optional capability blurb (Agent Card)"}}}},
-        {"name":"send","description":"Send a message/task to another agent by alias (or to:'all'). type='task' for work requests (gets task_id + lifecycle state).",
+        {"name":"send","description":"Send to: a bare alias (same team), 'team/alias' (cross-team), 'team:NAME' (team broadcast), 'all' (my team), or '*' (global). type='task' for work requests (task_id + lifecycle state).",
          "inputSchema":{"type":"object","properties":{
-            "to":{"type":"string","description":"recipient alias, or 'all'"},
-            "body":{"type":"string","description":"message text or JSON payload"},
+            "to":{"type":"string","description":"alias | team/alias | team:NAME | all | *"},
+            "body":{"type":"string"},
             "type":{"type":"string","enum":["task","status","message"]},
             "state":{"type":"string","enum":["submitted","working","completed","failed","info"]},
-            "task_id":{"type":"string","description":"reuse to update an existing task's status"}},
+            "task_id":{"type":"string","description":"reuse to update an existing task"}},
             "required":["to","body"]}},
-        {"name":"poll","description":"Fetch new messages addressed to THIS agent (and broadcasts) since last poll; advances the cursor.",
+        {"name":"poll","description":"Fetch new messages addressed to me / my team / global since last poll; advances the cursor.",
          "inputSchema":{"type":"object","properties":{}}},
-        {"name":"peers","description":"List known agents and their last-seen time + Agent Card.",
-         "inputSchema":{"type":"object","properties":{}}}
+        {"name":"peers","description":"List agents in my team (default), a named team (team:'NAME'), or everyone (team:'*'). This is the roster.",
+         "inputSchema":{"type":"object","properties":{"team":{"type":"string","description":"team name, or '*' for all"}}}}
     ])
 }
 
 // ---------------------------------------------------------------- MCP stdio server
-fn handle(conn: &Connection, alias: &str, req: &Value) -> Option<Value> {
+fn handle(conn: &Connection, team: &str, alias: &str, req: &Value) -> Option<Value> {
     let method = req["method"].as_str().unwrap_or("");
     let id = req.get("id").cloned();
     let params = &req["params"];
@@ -251,7 +306,7 @@ fn handle(conn: &Connection, alias: &str, req: &Value) -> Option<Value> {
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let out = call_tool(conn, alias, name, &args);
+            let out = call_tool(conn, team, alias, name, &args);
             let is_err = !out["ok"].as_bool().unwrap_or(true);
             Some(json!({"jsonrpc":"2.0","id":id,"result":{
                 "content":[{"type":"text","text":out.to_string()}],"isError":is_err}}))
@@ -267,9 +322,9 @@ fn handle(conn: &Connection, alias: &str, req: &Value) -> Option<Value> {
 }
 
 fn serve() {
-    let alias = alias_env();
+    let (team, alias) = (team_env(), alias_env());
     let conn = open_db();
-    eprintln!("[agent-bus] serve alias={} db={}", alias, db_path().display());
+    eprintln!("[agent-bus] serve {}/{} db={}", team, alias, db_path().display());
     let stdin = io::stdin();
     let mut out = io::stdout();
     for line in stdin.lock().lines() {
@@ -285,7 +340,7 @@ fn serve() {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if let Some(resp) = handle(&conn, &alias, &req) {
+        if let Some(resp) = handle(&conn, &team, &alias, &req) {
             let _ = writeln!(out, "{}", resp);
             let _ = out.flush();
         }
@@ -293,39 +348,44 @@ fn serve() {
 }
 
 // ---------------------------------------------------------------- CLI client
-fn cli_alias(flags: &HashMap<String, String>) -> String {
-    flags.get("as").cloned().unwrap_or_else(|| {
-        std::env::var("AGENT_BUS_ALIAS").unwrap_or_else(|_| "cli".into())
-    })
+fn cli_team(flags: &HashMap<String, String>) -> String {
+    flags.get("team").cloned().unwrap_or_else(team_env)
 }
-
+fn cli_alias(flags: &HashMap<String, String>) -> String {
+    flags.get("as").cloned().unwrap_or_else(|| std::env::var("AGENT_BUS_ALIAS").unwrap_or_else(|_| "cli".into()))
+}
 fn cli_send(flags: &HashMap<String, String>) {
     let conn = open_db();
-    let alias = cli_alias(flags);
     let mut args = json!({});
-    if let Some(v) = flags.get("to") { args["to"] = json!(v); }
-    if let Some(v) = flags.get("body") { args["body"] = json!(v); }
-    if let Some(v) = flags.get("type") { args["type"] = json!(v); }
-    if let Some(v) = flags.get("state") { args["state"] = json!(v); }
-    if let Some(v) = flags.get("task-id") { args["task_id"] = json!(v); }
-    println!("{}", call_tool(&conn, &alias, "send", &args));
+    for (k, j) in [("to", "to"), ("body", "body"), ("type", "type"), ("state", "state"), ("task-id", "task_id")] {
+        if let Some(v) = flags.get(k) {
+            args[j] = json!(v);
+        }
+    }
+    println!("{}", call_tool(&conn, &cli_team(flags), &cli_alias(flags), "send", &args));
 }
 fn cli_poll(flags: &HashMap<String, String>) {
     let conn = open_db();
-    println!("{}", call_tool(&conn, &cli_alias(flags), "poll", &json!({})));
+    println!("{}", call_tool(&conn, &cli_team(flags), &cli_alias(flags), "poll", &json!({})));
 }
-fn cli_peers() {
+fn cli_peers(flags: &HashMap<String, String>) {
     let conn = open_db();
-    println!("{}", call_tool(&conn, "cli", "peers", &json!({})));
+    let mut args = json!({});
+    if let Some(t) = flags.get("team") {
+        args["team"] = json!(t);
+    }
+    println!("{}", call_tool(&conn, &cli_team(flags), "cli", "peers", &args));
 }
 fn cli_register(flags: &HashMap<String, String>) {
     let conn = open_db();
     let mut args = json!({});
-    if let Some(v) = flags.get("card") { args["card"] = json!(v); }
-    println!("{}", call_tool(&conn, &cli_alias(flags), "register", &args));
+    if let Some(v) = flags.get("card") {
+        args["card"] = json!(v);
+    }
+    println!("{}", call_tool(&conn, &cli_team(flags), &cli_alias(flags), "register", &args));
 }
 
-// ---------------------------------------------------------------- installer
+// ---------------------------------------------------------------- installer / wizard
 fn prompt(label: &str, default: &str) -> String {
     print!("{} [{}]: ", label, default);
     io::stdout().flush().ok();
@@ -334,49 +394,84 @@ fn prompt(label: &str, default: &str) -> String {
     let s = s.trim();
     if s.is_empty() { default.to_string() } else { s.to_string() }
 }
+fn choose(label: &str, options: &[&str], default: &str) -> String {
+    println!("{}:", label);
+    for (i, o) in options.iter().enumerate() {
+        println!("  {}. {}{}", i + 1, o, if *o == default { " (default)" } else { "" });
+    }
+    let pick = prompt("  choose", default);
+    if let Ok(n) = pick.parse::<usize>() {
+        if n >= 1 && n <= options.len() {
+            return options[n - 1].to_string();
+        }
+    }
+    pick
+}
+// guess team/alias from a repo dir name: "astrub-classic" -> ("astrub","classic")
+fn guess_identity(name: &str) -> (String, String) {
+    match name.split_once('-') {
+        Some((t, a)) if !t.is_empty() && !a.is_empty() => (t.to_string(), a.to_string()),
+        _ => ("default".to_string(), name.to_string()),
+    }
+}
+fn basename(path: &str) -> String {
+    PathBuf::from(path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "agent".into())
+}
 
-fn bootstrap_block(alias: &str) -> String {
-    let inbox = inbox_dir().join(format!("{}.flag", alias));
-    format!(
-        "<!-- agent-bus-bootstrap -->\n\
-## agent-bus (cross-session coordination)\n\
-This repo has the `agent-bus` MCP server (alias `{a}`). At session start:\n\
-1. Call `mcp__agent-bus__register` with a short capability card.\n\
-2. Arm a doorbell so inbound mail wakes you:\n\
-```\n\
-Monitor(persistent:true, timeout_ms:3600000, command: |\n\
-  last=\"\"; while true; do\n\
-    if [ -f {inbox} ]; then m=$(stat -f %m {inbox} 2>/dev/null);\n\
-      if [ \"$m\" != \"$last\" ]; then echo \"BUS: new mail for {a} — call agent-bus poll()\"; last=\"$m\"; fi; fi;\n\
-    sleep 2; done)\n\
-```\n\
-3. On a `BUS:` ping, call `mcp__agent-bus__poll` and act on the messages.\n\
-4. Reply with `mcp__agent-bus__send` (to=\"sync\", etc.).\n\
-<!-- /agent-bus-bootstrap -->\n",
-        a = alias,
-        inbox = inbox.display()
-    )
+fn wizard() {
+    println!("agent-bus — first-time setup\n");
+    let tool = choose("Which tool is this for", &["claude", "codex", "copilot"], "claude");
+    let cwd = std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| ".".into());
+    let repo = if tool == "claude" {
+        prompt("Target repo path", &cwd)
+    } else {
+        cwd.clone()
+    };
+    let (gt, ga) = guess_identity(&basename(&repo));
+    let team = prompt("Team (logical group)", &gt);
+    let alias = prompt("Alias (this agent's name)", &ga);
+    apply_install(&tool, &team, &alias, &repo);
 }
 
 fn install(flags: &HashMap<String, String>) {
-    let tool = flags.get("tool").cloned().unwrap_or_else(|| prompt("Tool (claude/codex/copilot)", "claude"));
-    let alias = flags.get("alias").cloned().unwrap_or_else(|| prompt("Alias", "agent"));
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "agent-bus".into());
+    // fully-specified -> non-interactive; otherwise fall into the wizard for missing bits
+    if flags.is_empty() {
+        return wizard();
+    }
+    let cwd = std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| ".".into());
+    let tool = flags.get("tool").cloned().unwrap_or_else(|| choose("Tool", &["claude", "codex", "copilot"], "claude"));
+    let repo = flags.get("repo").cloned().unwrap_or_else(|| if tool == "claude" { prompt("Target repo path", &cwd) } else { cwd.clone() });
+    let (gt, ga) = guess_identity(&basename(&repo));
+    let team = flags.get("team").cloned().unwrap_or_else(|| prompt("Team", &gt));
+    let alias = flags.get("alias").cloned().unwrap_or_else(|| prompt("Alias", &ga));
+    apply_install(&tool, &team, &alias, &repo);
+}
 
-    match tool.as_str() {
-        "claude" => {
-            let repo = flags.get("repo").cloned().unwrap_or_else(|| prompt("Target repo path", "."));
-            install_claude(&repo, &alias, &exe);
-        }
-        "codex" => install_codex(&alias, &exe),
-        "copilot" => print_copilot(&alias, &exe),
+fn apply_install(tool: &str, team: &str, alias: &str, repo: &str) {
+    let exe = std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| "agent-bus".into());
+    match tool {
+        "claude" => install_claude(repo, team, alias, &exe),
+        "codex" => install_codex(team, alias, &exe),
+        "copilot" => print_copilot(team, alias, &exe),
         other => eprintln!("unknown tool: {} (use claude|codex|copilot)", other),
     }
 }
 
-fn install_claude(repo: &str, alias: &str, exe: &str) {
+fn upsert_block(existing: &str, block: &str) -> String {
+    let start = "<!-- agent-bus-bootstrap -->";
+    let end = "<!-- /agent-bus-bootstrap -->";
+    if let (Some(s), Some(e)) = (existing.find(start), existing.find(end)) {
+        let mut out = String::new();
+        out.push_str(&existing[..s]);
+        out.push_str(block.trim_end());
+        out.push_str(&existing[e + end.len()..]);
+        out
+    } else {
+        format!("{}\n{}\n", existing.trim_end(), block)
+    }
+}
+
+fn install_claude(repo: &str, team: &str, alias: &str, exe: &str) {
     let mcp_path = PathBuf::from(repo).join(".mcp.json");
     let mut root: Value = if mcp_path.exists() {
         serde_json::from_str(&fs::read_to_string(&mcp_path).unwrap_or_default()).unwrap_or(json!({}))
@@ -390,34 +485,31 @@ fn install_claude(repo: &str, alias: &str, exe: &str) {
         root["mcpServers"] = json!({});
     }
     root["mcpServers"]["agent-bus"] = json!({
-        "command": exe, "args": ["serve"], "env": {"AGENT_BUS_ALIAS": alias}
+        "command": exe, "args": ["serve"],
+        "env": {"AGENT_BUS_TEAM": team, "AGENT_BUS_ALIAS": alias}
     });
     fs::write(&mcp_path, serde_json::to_string_pretty(&root).unwrap() + "\n").expect("write .mcp.json");
     println!("✓ wrote {}", mcp_path.display());
 
     let cm = PathBuf::from(repo).join("CLAUDE.md");
     let existing = fs::read_to_string(&cm).unwrap_or_default();
-    if existing.contains("<!-- agent-bus-bootstrap -->") {
-        println!("• CLAUDE.md already has the agent-bus bootstrap");
-    } else {
-        let mut f = fs::OpenOptions::new().create(true).append(true).open(&cm).expect("open CLAUDE.md");
-        write!(f, "\n{}\n", bootstrap_block(alias)).expect("append CLAUDE.md");
-        println!("✓ appended bootstrap to {}", cm.display());
-    }
+    let updated = upsert_block(&existing, &bootstrap_block(team, alias));
+    fs::write(&cm, updated).expect("write CLAUDE.md");
+    println!("✓ wrote agent-bus bootstrap into {}", cm.display());
     println!("→ restart the Claude Code session in {} and approve the agent-bus MCP prompt", repo);
 }
 
-fn install_codex(alias: &str, exe: &str) {
+fn install_codex(team: &str, alias: &str, exe: &str) {
     let path = home_dir().join(".codex").join("config.toml");
     fs::create_dir_all(path.parent().unwrap()).ok();
     let existing = fs::read_to_string(&path).unwrap_or_default();
     if existing.contains("[mcp_servers.agent-bus]") {
-        println!("• {} already has [mcp_servers.agent-bus]", path.display());
+        println!("• {} already has [mcp_servers.agent-bus] (edit it by hand to change team/alias)", path.display());
         return;
     }
     let block = format!(
-        "\n[mcp_servers.agent-bus]\ncommand = \"{}\"\nargs = [\"serve\"]\nenv = {{ AGENT_BUS_ALIAS = \"{}\" }}\n",
-        exe, alias
+        "\n[mcp_servers.agent-bus]\ncommand = \"{}\"\nargs = [\"serve\"]\nenv = {{ AGENT_BUS_TEAM = \"{}\", AGENT_BUS_ALIAS = \"{}\" }}\n",
+        exe, team, alias
     );
     let mut f = fs::OpenOptions::new().create(true).append(true).open(&path).expect("open config.toml");
     write!(f, "{}", block).expect("append config.toml");
@@ -425,12 +517,35 @@ fn install_codex(alias: &str, exe: &str) {
     println!("→ restart Codex to load it");
 }
 
-fn print_copilot(alias: &str, exe: &str) {
-    println!("Add this MCP server to Copilot's config (alias {}):", alias);
+fn print_copilot(team: &str, alias: &str, exe: &str) {
+    println!("Add this MCP server to Copilot's config:");
     println!("  command: {}", exe);
     println!("  args:    [\"serve\"]");
-    println!("  env:     AGENT_BUS_ALIAS={}", alias);
+    println!("  env:     AGENT_BUS_TEAM={}  AGENT_BUS_ALIAS={}", team, alias);
     println!("Then call poll() at the start of each turn (Copilot has no background watcher).");
+}
+
+fn bootstrap_block(team: &str, alias: &str) -> String {
+    let fp = flag_path(team, alias);
+    format!(
+        "<!-- agent-bus-bootstrap -->\n\
+## agent-bus (cross-session coordination)\n\
+This repo has the `agent-bus` MCP server, identity `{team}/{alias}`. At session start:\n\
+1. Call `mcp__agent-bus__register` with a short capability card.\n\
+2. Arm a doorbell so inbound mail wakes you:\n\
+```\n\
+Monitor(persistent:true, timeout_ms:3600000, command: |\n\
+  f={flag}; last=\"\"; while true; do\n\
+    if [ -f \"$f\" ]; then m=$(stat -f %m \"$f\" 2>/dev/null);\n\
+      if [ \"$m\" != \"$last\" ]; then echo \"BUS: new mail for {team}/{alias} — call agent-bus poll()\"; last=\"$m\"; fi; fi;\n\
+    sleep 2; done)\n\
+```\n\
+3. On a `BUS:` ping, call `mcp__agent-bus__poll` and act on the messages.\n\
+4. Reply with `mcp__agent-bus__send` — to=\"alias\" (same team), \"team/alias\" (cross-team), or \"team:{team}\" (broadcast).\n\
+5. `mcp__agent-bus__peers` lists your team roster (team:\"*\" = everyone).\n\
+<!-- /agent-bus-bootstrap -->",
+        team = team, alias = alias, flag = fp.display()
+    )
 }
 
 // ---------------------------------------------------------------- arg parsing
@@ -452,18 +567,6 @@ fn parse_flags(args: &[String]) -> HashMap<String, String> {
     m
 }
 
-fn usage() {
-    eprintln!(
-        "agent-bus <command>\n\
-  serve                      run the MCP stdio server (used by MCP configs)\n\
-  install [--tool t --alias a --repo p]   interactive installer\n\
-  send --to X --body Y [--type task] [--state s] [--task-id id] [--as alias]\n\
-  poll [--as alias]\n\
-  peers\n\
-  register [--card ..] [--as alias]"
-    );
-}
-
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let cmd = argv.get(1).map(|s| s.as_str()).unwrap_or("");
@@ -473,9 +576,14 @@ fn main() {
         "install" => install(&flags),
         "send" => cli_send(&flags),
         "poll" => cli_poll(&flags),
-        "peers" => cli_peers(),
+        "peers" => cli_peers(&flags),
         "register" => cli_register(&flags),
-        _ => usage(),
+        "" | "setup" => wizard(),
+        _ => {
+            eprintln!(
+                "agent-bus <command>\n  (no command) | setup    interactive first-time setup\n  serve                    MCP stdio server\n  install [--tool --team --alias --repo]\n  send --to X --body Y [--type task] [--state s] [--task-id id] [--team t] [--as a]\n  poll [--team t] [--as a]\n  peers [--team t|*]\n  register [--card ..] [--team t] [--as a]"
+            );
+        }
     }
 }
 
@@ -491,60 +599,91 @@ mod tests {
     }
 
     #[test]
-    fn task_roundtrip_and_lifecycle() {
+    fn same_team_task_roundtrip() {
         let c = mem();
-        // sync sends a task to classic
-        let r = tool_send(&c, "sync", &json!({"to":"classic","type":"task","body":"execute Phase 7"})).unwrap();
+        let r = tool_send(&c, "astrub", "sync", &json!({"to":"classic","type":"task","body":"execute Phase 7"})).unwrap();
         assert!(r["ok"].as_bool().unwrap());
+        assert_eq!(r["to"].as_str().unwrap(), "astrub/classic");
         let task_id = r["task_id"].as_str().unwrap().to_string();
 
-        // classic polls (registered late / never) -> receives it
-        let r = tool_poll(&c, "classic").unwrap();
+        let r = tool_poll(&c, "astrub", "classic").unwrap();
         assert_eq!(r["count"].as_i64().unwrap(), 1);
         assert_eq!(r["messages"][0]["task_id"].as_str().unwrap(), task_id);
+        assert_eq!(r["messages"][0]["from"].as_str().unwrap(), "astrub/sync");
 
-        // re-poll -> drained
-        assert_eq!(tool_poll(&c, "classic").unwrap()["count"].as_i64().unwrap(), 0);
+        // re-poll drains
+        assert_eq!(tool_poll(&c, "astrub", "classic").unwrap()["count"], 0);
 
-        // classic replies completed on the same task_id; sync polls
-        tool_send(&c, "classic", &json!({"to":"sync","type":"status","state":"completed","task_id":task_id,"body":"255 green"})).unwrap();
-        let r = tool_poll(&c, "sync").unwrap();
-        assert_eq!(r["count"].as_i64().unwrap(), 1);
+        // completed reply on same task_id
+        tool_send(&c, "astrub", "classic", &json!({"to":"sync","type":"status","state":"completed","task_id":task_id,"body":"255 green"})).unwrap();
+        let r = tool_poll(&c, "astrub", "sync").unwrap();
         assert_eq!(r["messages"][0]["state"].as_str().unwrap(), "completed");
-        assert_eq!(r["messages"][0]["task_id"].as_str().unwrap(), task_id);
     }
 
     #[test]
-    fn peers_and_broadcast() {
+    fn team_isolation_and_cross_team() {
         let c = mem();
-        tool_register(&c, "sync", &json!({"card":"planning"})).unwrap();
-        tool_register(&c, "classic", &json!({"card":"rust"})).unwrap();
-        let r = tool_peers(&c).unwrap();
-        let aliases: Vec<&str> = r["peers"].as_array().unwrap().iter().map(|p| p["alias"].as_str().unwrap()).collect();
-        assert!(aliases.contains(&"sync") && aliases.contains(&"classic"));
+        // astrub/sync broadcasts to its own team
+        tool_send(&c, "astrub", "sync", &json!({"to":"all","body":"team note"})).unwrap();
+        // a different team must NOT see it
+        assert_eq!(tool_poll(&c, "webapp", "api").unwrap()["count"], 0);
+        // astrub member sees it
+        assert_eq!(tool_poll(&c, "astrub", "classic").unwrap()["count"], 1);
 
-        tool_send(&c, "sync", &json!({"to":"all","body":"hello all"})).unwrap();
-        let r = tool_poll(&c, "classic").unwrap();
-        assert!(r["messages"].as_array().unwrap().iter().any(|m| m["body"] == "hello all"));
+        // explicit cross-team direct
+        tool_send(&c, "astrub", "sync", &json!({"to":"webapp/api","body":"hi other team"})).unwrap();
+        let r = tool_poll(&c, "webapp", "api").unwrap();
+        assert_eq!(r["count"].as_i64().unwrap(), 1);
+        assert_eq!(r["messages"][0]["from"].as_str().unwrap(), "astrub/sync");
     }
 
     #[test]
-    fn missing_to_is_soft_error() {
+    fn team_broadcast_and_global() {
         let c = mem();
-        let r = tool_send(&c, "sync", &json!({"body":"no recipient"})).unwrap();
-        assert!(!r["ok"].as_bool().unwrap());
+        tool_send(&c, "ops", "boss", &json!({"to":"team:astrub","body":"hello astrub"})).unwrap();
+        assert_eq!(tool_poll(&c, "astrub", "classic").unwrap()["count"], 1);
+        assert_eq!(tool_poll(&c, "ops", "boss").unwrap()["count"], 0); // not addressed to ops
+
+        tool_send(&c, "ops", "boss", &json!({"to":"*","body":"global"})).unwrap();
+        // astrub/client never polled: it gets BOTH the earlier team:astrub broadcast AND the global one
+        let r = tool_poll(&c, "astrub", "client").unwrap();
+        assert_eq!(r["count"].as_i64().unwrap(), 2);
+        assert!(r["messages"].as_array().unwrap().iter().any(|m| m["body"] == "global"));
+        // webapp/api is not in astrub, so it only gets the global broadcast
+        let r = tool_poll(&c, "webapp", "api").unwrap();
+        assert_eq!(r["count"].as_i64().unwrap(), 1);
+        assert_eq!(r["messages"][0]["body"].as_str().unwrap(), "global");
     }
 
     #[test]
-    fn mcp_initialize_handshake() {
+    fn peers_roster_scoping() {
         let c = mem();
-        let resp = handle(&c, "sync", &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})).unwrap();
+        tool_register(&c, "astrub", "sync", &json!({"card":"planning"})).unwrap();
+        tool_register(&c, "astrub", "classic", &json!({})).unwrap();
+        tool_register(&c, "webapp", "api", &json!({})).unwrap();
+
+        let mine = tool_peers(&c, "astrub", &json!({})).unwrap();
+        let names: Vec<&str> = mine["peers"].as_array().unwrap().iter().map(|p| p["alias"].as_str().unwrap()).collect();
+        assert!(names.contains(&"sync") && names.contains(&"classic") && !names.contains(&"api"));
+
+        let all = tool_peers(&c, "astrub", &json!({"team":"*"})).unwrap();
+        assert_eq!(all["peers"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn guess_identity_from_repo_name() {
+        assert_eq!(guess_identity("astrub-classic"), ("astrub".into(), "classic".into()));
+        assert_eq!(guess_identity("astrub-client"), ("astrub".into(), "client".into()));
+        assert_eq!(guess_identity("standalone"), ("default".into(), "standalone".into()));
+    }
+
+    #[test]
+    fn mcp_handshake() {
+        let c = mem();
+        let resp = handle(&c, "astrub", "sync", &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})).unwrap();
         assert_eq!(resp["result"]["serverInfo"]["name"], "agent-bus");
-        assert_eq!(resp["result"]["protocolVersion"], "2025-06-18");
-        // notification -> no response
-        assert!(handle(&c, "sync", &json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none());
-        // tools/list
-        let resp = handle(&c, "sync", &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
+        assert!(handle(&c, "astrub", "sync", &json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none());
+        let resp = handle(&c, "astrub", "sync", &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
         assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 4);
     }
 }

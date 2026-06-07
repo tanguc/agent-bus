@@ -21,7 +21,8 @@ agent-bus peers
 agent-bus register [--card ..] [--as alias]
 ```
 
-Identity is `AGENT_BUS_ALIAS` (server) or `--as` (CLI): `sync`, `classic`, `client`, ...
+Identity is `team/alias` — `AGENT_BUS_TEAM`+`AGENT_BUS_ALIAS` (server) or `--team`/`--as` (CLI):
+`astrub/sync`, `astrub/classic`, `astrub/client`, `webapp/api`, ...
 
 ## Why this shape
 - **South side = MCP** — the one protocol every CLI agent already speaks as a client.
@@ -33,18 +34,22 @@ Identity is `AGENT_BUS_ALIAS` (server) or `--as` (CLI): `sync`, `classic`, `clie
   Each CLI needs its own small wake-shim — that cost is protocol-independent.
 
 ## Install (the easy way)
-Run the installer once per session/tool — it writes the config and, for Claude,
-appends a self-bootstrap block to that repo's `CLAUDE.md`:
+Just run the binary — bare `agent-bus` (or `agent-bus setup`) launches an interactive
+wizard that asks tool / team / alias / repo and pre-guesses `team/alias` from the repo
+name (`astrub-classic` → team `astrub`, alias `classic`). It writes the config and, for
+Claude, upserts a self-bootstrap block into that repo's `CLAUDE.md`.
+
 ```bash
-# Claude Code repo:
-target/release/agent-bus install --tool claude --alias classic --repo ~/Projects/personal/astrub-classic
-# Codex (writes ~/.codex/config.toml):
-target/release/agent-bus install --tool codex --alias codexer
-# Copilot (prints the snippet to add):
-target/release/agent-bus install --tool copilot --alias copilot
+agent-bus                 # interactive first-time setup
 ```
-Run with no flags for interactive prompts. After installing, **restart that session**
-and approve the `agent-bus` MCP prompt.
+
+Non-interactive (flags skip the prompts):
+```bash
+agent-bus install --tool claude --team astrub --alias classic --repo ~/Projects/personal/astrub-classic
+agent-bus install --tool codex   --team astrub --alias codexer     # writes ~/.codex/config.toml
+agent-bus install --tool copilot --team astrub --alias copilot      # prints the snippet
+```
+After installing, **restart that session** and approve the `agent-bus` MCP prompt.
 
 ### What the config looks like (Claude `.mcp.json`)
 ```json
@@ -53,7 +58,7 @@ and approve the `agent-bus` MCP prompt.
     "agent-bus": {
       "command": "~/.cargo/bin/agent-bus",
       "args": ["serve"],
-      "env": { "AGENT_BUS_ALIAS": "classic" }
+      "env": { "AGENT_BUS_TEAM": "astrub", "AGENT_BUS_ALIAS": "classic" }
     }
   }
 }
@@ -62,28 +67,46 @@ and approve the `agent-bus` MCP prompt.
 ## Tools (MCP)
 | Tool | Purpose |
 |------|---------|
-| `register(card?)` | register/refresh THIS agent + optional Agent Card |
-| `send(to, body, type?, state?, task_id?)` | send to an alias (or `to:"all"`); `type:"task"` for work requests |
-| `poll()` | fetch new messages addressed to me + broadcasts; advance cursor |
-| `peers()` | list known agents + last-seen + Agent Card |
+| `register(card?)` | register/refresh THIS agent (team+alias) + optional Agent Card |
+| `send(to, body, type?, state?, task_id?)` | see addressing below; `type:"task"` for work requests |
+| `poll()` | fetch new messages for me / my team / global since last poll; advance cursor |
+| `peers(team?)` | the roster: my team (default), a named team, or everyone (`team:"*"`) |
+
+### Addressing (`send` `to`)
+| `to` | meaning |
+|------|---------|
+| `"classic"` | same-team direct → `<myteam>/classic` |
+| `"webapp/api"` | cross-team direct |
+| `"team:astrub"` | broadcast to everyone in team `astrub` |
+| `"all"` | broadcast to my team |
+| `"*"` | global broadcast (every team) |
+
+## Teams / rosters
+A **team** is a logical namespace over one shared bus — same-team is the default scope,
+cross-team is addressable explicitly, and `peers()` is the team roster (derived, never
+cached). One physical `bus.db`, many logical teams. So astrub's many repos group as team
+`astrub` (`astrub/sync`, `astrub/classic`, `astrub/client`); a different project is its
+own team on the same bus with no cross-chatter unless explicitly addressed. Mirrors the
+astrub cockpit-group / party philosophy, one layer up (agents instead of game accounts).
 
 ## Wake (doorbell) — Claude Code
 The installer's CLAUDE.md block arms this automatically; manually it's:
 ```
 Monitor(persistent:true, timeout_ms:3600000, command: |
-  f=~/.agent-bus/inbox/sync.flag; last=""; while true; do
-    if [ -f $f ]; then m=$(stat -f %m $f 2>/dev/null);
-      if [ "$m" != "$last" ]; then echo "BUS: new mail for sync — call agent-bus poll()"; last="$m"; fi; fi;
+  f=~/.agent-bus/inbox/astrub/sync.flag; last=""; while true; do
+    if [ -f "$f" ]; then m=$(stat -f %m "$f" 2>/dev/null);
+      if [ "$m" != "$last" ]; then echo "BUS: new mail for astrub/sync — call agent-bus poll()"; last="$m"; fi; fi;
     sleep 2; done)
 ```
 Codex/Copilot: no background watcher — call `poll()` at the start of each turn, or run
-`fswatch ~/.agent-bus/inbox/<alias>.flag` in a terminal.
+`fswatch ~/.agent-bus/inbox/<team>/<alias>.flag` in a terminal.
 
 ## Config / state
-- `AGENT_BUS_ALIAS` — this session's identity (default `unknown`).
+- `AGENT_BUS_TEAM` — logical group (default `default`).
+- `AGENT_BUS_ALIAS` — this agent's name within the team (default `unknown`).
 - `AGENT_BUS_HOME` — state dir (default `~/.agent-bus`).
 - `AGENT_BUS_DB` — SQLite path (default `$AGENT_BUS_HOME/bus.db`).
-- State (`bus.db`, `inbox/*.flag`) lives under `~/.agent-bus/` — never in a project repo.
+- State (`bus.db`, `inbox/<team>/<alias>.flag`) lives under `~/.agent-bus/` — never in a repo.
 
 ## Test
 ```bash
