@@ -1,0 +1,42 @@
+version: '3'
+
+# agent-bus build/install tasks. Run `task` for the list.
+
+tasks:
+  default:
+    desc: List tasks
+    cmds:
+      - task --list
+    silent: true
+
+  build:
+    desc: Build the release (prod) binary -> target/release/agent-bus
+    cmds:
+      - cargo build --release
+      - echo "built -> {{.TASKFILE_DIR}}/target/release/agent-bus"
+
+  test:
+    desc: Run the test suite
+    cmds:
+      - cargo test
+
+  install:
+    desc: Build in prod mode and install globally to ~/.cargo/bin/agent-bus (must be on PATH)
+    deps: [test]
+    cmds:
+      - cargo install --path . --force
+      - 'echo "installed -> $(command -v agent-bus || echo ~/.cargo/bin/agent-bus)"'
+      - 'echo "next: run \"agent-bus\" in a repo for the setup wizard"'
+
+  uninstall:
+    desc: Remove the global binary
+    cmds:
+      - cargo uninstall agent-bus || true
+
+  setup:
+    desc: Run the interactive setup wizard (uses the global binary if installed, else the release build)
+    cmds:
+      - '{{if eq (.GLOBAL) "yes"}}agent-bus{{else}}./target/release/agent-bus{{end}} setup'
+    vars:
+      GLOBAL:
+        sh: 'command -v agent-bus >/dev/null 2>&1 && echo yes || echo no'

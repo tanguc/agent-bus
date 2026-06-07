@@ -352,7 +352,11 @@ fn cli_team(flags: &HashMap<String, String>) -> String {
     flags.get("team").cloned().unwrap_or_else(team_env)
 }
 fn cli_alias(flags: &HashMap<String, String>) -> String {
-    flags.get("as").cloned().unwrap_or_else(|| std::env::var("AGENT_BUS_ALIAS").unwrap_or_else(|_| "cli".into()))
+    flags
+        .get("as")
+        .or_else(|| flags.get("alias"))
+        .cloned()
+        .unwrap_or_else(|| std::env::var("AGENT_BUS_ALIAS").unwrap_or_else(|_| "cli".into()))
 }
 fn cli_send(flags: &HashMap<String, String>) {
     let conn = open_db();
@@ -593,6 +597,13 @@ mod tests {
     use super::*;
 
     fn mem() -> Connection {
+        // route doorbell flag writes to a throwaway home so tests never touch ~/.agent-bus
+        use std::sync::Once;
+        static O: Once = Once::new();
+        O.call_once(|| {
+            let d = std::env::temp_dir().join(format!("agent-bus-test-{}", std::process::id()));
+            std::env::set_var("AGENT_BUS_HOME", d);
+        });
         let c = Connection::open_in_memory().unwrap();
         init_schema(&c);
         c
