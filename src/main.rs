@@ -1017,6 +1017,43 @@ fn upsert_block(existing: &str, block: &str) -> String {
     }
 }
 
+fn wire_session_hook(repo: &str, team: &str, alias: &str) {
+    let dir  = PathBuf::from(repo).join(".claude");
+    fs::create_dir_all(&dir).ok();
+    let path = dir.join("settings.local.json");
+    let mut root: Value = if path.exists() {
+        serde_json::from_str(&fs::read_to_string(&path).unwrap_or_default()).unwrap_or(json!({}))
+    } else {
+        json!({})
+    };
+    if !root.is_object() { root = json!({}); }
+
+    let hook_cmd = format!("agent-bus poll --team {} --as {}", team, alias);
+
+    // check if our hook already exists
+    let already = root["hooks"]["SessionStart"]
+        .as_array()
+        .map(|arr| arr.iter().any(|entry| {
+            entry["hooks"].as_array().map(|h| h.iter().any(|hk| {
+                hk["command"].as_str() == Some(&hook_cmd)
+            })).unwrap_or(false)
+        }))
+        .unwrap_or(false);
+
+    if already {
+        println!("• SessionStart hook already present in {}", path.display());
+        return;
+    }
+
+    if !root["hooks"].is_object() { root["hooks"] = json!({}); }
+    let mut starts = root["hooks"]["SessionStart"].as_array().cloned().unwrap_or_default();
+    starts.push(json!({"hooks": [{"type": "command", "command": hook_cmd}]}));
+    root["hooks"]["SessionStart"] = json!(starts);
+
+    fs::write(&path, serde_json::to_string_pretty(&root).unwrap() + "\n").ok();
+    println!("wired SessionStart hook in {}", path.display());
+}
+
 fn install_claude(repo: &str, team: &str, alias: &str, exe: &str) {
     let mcp_path = PathBuf::from(repo).join(".mcp.json");
     let mut root: Value = if mcp_path.exists() {
@@ -1040,6 +1077,7 @@ fn install_claude(repo: &str, team: &str, alias: &str, exe: &str) {
     println!("wrote agent-bus bootstrap into {}", cm.display());
 
     enable_mcp_setting(repo);
+    wire_session_hook(repo, team, alias);
     println!("restart the Claude Code session in {} (no approval prompt — auto-enabled)", repo);
 }
 
