@@ -34,7 +34,14 @@ QoL + hardening backlog, roughly priority-ordered. Nothing here blocks current u
 
 ## Cutover (parallel-trial -> agent-bus primary)
 Owner decision, applied to ALL THREE sessions at once. Preconditions:
-- [ ] all three (sync/classic/client) restarted + actively polling (fresh `last_seen`)
-- [ ] a real client -> classic -> client round-trip succeeds over the bus (same task_id)
-- [ ] only then: decommission the `.md` auto-monitoring in each repo's CLAUDE.md together
-      (classic already removed its .md monitor early — re-add until cutover).
+- [x] all three (sync/classic/client) restarted + actively polling (fresh `last_seen`)
+      — classic + client confirmed live + polling; sync active via CLI (2026-06-07)
+- [x] a real client -> classic -> client round-trip succeeds over the bus (same task_id)
+      — LANDED 2026-06-07: client tasks 7ba47430 + b0cbe5c0 -> classic working/completed
+        on same task_ids -> client confirmed, referenced fix commits 42201e7, 06a31a2.
+        Bus-only, no .md. Two real server bugs fixed over the bus.
+- [ ] OWNER DECISION (the only remaining gate): formalize bus-primary across all three.
+      Current drift to reconcile: client is already BUS-ONLY (owner-directed); classic +
+      sync are still dual. Decide: (a) decommission `.md` auto-monitoring/docs in sync +
+      classic too -> bus is the one channel; or (b) re-align client to dual.
+      Recommendation: (a) — the bus is proven load-bearing and client already moved.
