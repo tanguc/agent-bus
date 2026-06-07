@@ -254,6 +254,26 @@ fn tool_peers(conn: &Connection, my_team: &str, args: &Value) -> rusqlite::Resul
     Ok(json!({"ok": true, "scope": filter, "peers": peers}))
 }
 
+// registry helpers — the bus IS the registry (derived from the peers table)
+fn list_teams(conn: &Connection) -> Vec<(String, i64)> {
+    let mut stmt = match conn.prepare("SELECT team, COUNT(*) FROM peers GROUP BY team ORDER BY team") {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+fn list_aliases(conn: &Connection, team: &str) -> Vec<String> {
+    let mut stmt = match conn.prepare("SELECT alias FROM peers WHERE team=?1 ORDER BY alias") {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map(params![team], |r| r.get::<_, String>(0))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
 fn call_tool(conn: &Connection, team: &str, alias: &str, name: &str, args: &Value) -> Value {
     let r = match name {
         "register" => tool_register(conn, team, alias, args),
@@ -388,6 +408,11 @@ fn cli_register(flags: &HashMap<String, String>) {
     }
     println!("{}", call_tool(&conn, &cli_team(flags), &cli_alias(flags), "register", &args));
 }
+fn cli_teams() {
+    let conn = open_db();
+    let teams: Vec<Value> = list_teams(&conn).iter().map(|(t, n)| json!({"team": t, "agents": n})).collect();
+    println!("{}", json!({"ok": true, "teams": teams}));
+}
 
 // ---------------------------------------------------------------- installer / wizard
 fn prompt(label: &str, default: &str) -> String {
@@ -422,8 +447,34 @@ fn basename(path: &str) -> String {
     PathBuf::from(path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "agent".into())
 }
 
+// registry-aware pickers: show what teams/aliases already exist so you choose from
+// reality instead of guessing. The path-guess is just the default.
+fn pick_team(conn: &Connection, default: &str) -> String {
+    let teams = list_teams(conn);
+    if teams.is_empty() {
+        println!("(no teams yet — you're creating the first one)");
+    } else {
+        println!("Existing teams:");
+        for (t, n) in &teams {
+            println!("  - {} ({} agent{})", t, n, if *n == 1 { "" } else { "s" });
+        }
+    }
+    prompt("Team (logical group)", default)
+}
+fn pick_alias(conn: &Connection, team: &str, default: &str) -> String {
+    let al = list_aliases(conn, team);
+    if !al.is_empty() {
+        println!("Agents already in '{}': {}", team, al.join(", "));
+    }
+    let a = prompt("Alias (this agent's name)", default);
+    if al.iter().any(|x| x == &a) {
+        println!("note: {}/{} already exists — installing reuses that identity", team, a);
+    }
+    a
+}
+
 fn wizard() {
-    println!("agent-bus — first-time setup\n");
+    println!("agent-bus — setup\n");
     let tool = choose("Which tool is this for", &["claude", "codex", "copilot"], "claude");
     let cwd = std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| ".".into());
     let repo = if tool == "claude" {
@@ -432,8 +483,9 @@ fn wizard() {
         cwd.clone()
     };
     let (gt, ga) = guess_identity(&basename(&repo));
-    let team = prompt("Team (logical group)", &gt);
-    let alias = prompt("Alias (this agent's name)", &ga);
+    let conn = open_db();
+    let team = pick_team(&conn, &gt);
+    let alias = pick_alias(&conn, &team, &ga);
     apply_install(&tool, &team, &alias, &repo);
 }
 
@@ -446,8 +498,9 @@ fn install(flags: &HashMap<String, String>) {
     let tool = flags.get("tool").cloned().unwrap_or_else(|| choose("Tool", &["claude", "codex", "copilot"], "claude"));
     let repo = flags.get("repo").cloned().unwrap_or_else(|| if tool == "claude" { prompt("Target repo path", &cwd) } else { cwd.clone() });
     let (gt, ga) = guess_identity(&basename(&repo));
-    let team = flags.get("team").cloned().unwrap_or_else(|| prompt("Team", &gt));
-    let alias = flags.get("alias").cloned().unwrap_or_else(|| prompt("Alias", &ga));
+    let conn = open_db();
+    let team = flags.get("team").cloned().unwrap_or_else(|| pick_team(&conn, &gt));
+    let alias = flags.get("alias").cloned().unwrap_or_else(|| pick_alias(&conn, &team, &ga));
     apply_install(&tool, &team, &alias, &repo);
 }
 
@@ -457,8 +510,16 @@ fn apply_install(tool: &str, team: &str, alias: &str, repo: &str) {
         "claude" => install_claude(repo, team, alias, &exe),
         "codex" => install_codex(team, alias, &exe),
         "copilot" => print_copilot(team, alias, &exe),
-        other => eprintln!("unknown tool: {} (use claude|codex|copilot)", other),
+        other => {
+            eprintln!("unknown tool: {} (use claude|codex|copilot)", other);
+            return;
+        }
     }
+    // seed the registry so this identity appears for the NEXT setup's team/roster picker,
+    // even before the session has started. The live session re-registers on start.
+    let conn = open_db();
+    let _ = tool_register(&conn, team, alias, &json!({"card": format!("installed for {}", tool)}));
+    println!("✓ registered {}/{} on the bus", team, alias);
 }
 
 fn upsert_block(existing: &str, block: &str) -> String {
@@ -607,11 +668,12 @@ fn main() {
         "send" => cli_send(&flags),
         "poll" => cli_poll(&flags),
         "peers" => cli_peers(&flags),
+        "teams" => cli_teams(),
         "register" => cli_register(&flags),
         "" | "setup" => wizard(),
         _ => {
             eprintln!(
-                "agent-bus <command>\n  (no command) | setup    interactive first-time setup\n  serve                    MCP stdio server\n  install [--tool --team --alias --repo]\n  send --to X --body Y [--type task] [--state s] [--task-id id] [--team t] [--as a]\n  poll [--team t] [--as a]\n  peers [--team t|*]\n  register [--card ..] [--team t] [--as a]"
+                "agent-bus <command>\n  (no command) | setup    interactive first-time setup\n  serve                    MCP stdio server\n  install [--tool --team --alias --repo]\n  send --to X --body Y [--type task] [--state s] [--task-id id] [--team t] [--as a]\n  poll [--team t] [--as a]\n  peers [--team t|*]\n  teams                    list known teams (the registry)\n  register [--card ..] [--team t] [--as a]"
             );
         }
     }
@@ -705,6 +767,21 @@ mod tests {
 
         let all = tool_peers(&c, "astrub", &json!({"team":"*"})).unwrap();
         assert_eq!(all["peers"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn registry_lists_teams_and_aliases() {
+        let c = mem();
+        tool_register(&c, "astrub", "sync", &json!({})).unwrap();
+        tool_register(&c, "astrub", "classic", &json!({})).unwrap();
+        tool_register(&c, "webapp", "api", &json!({})).unwrap();
+        let teams = list_teams(&c);
+        assert!(teams.iter().any(|(t, n)| t == "astrub" && *n == 2));
+        assert!(teams.iter().any(|(t, n)| t == "webapp" && *n == 1));
+        let mut al = list_aliases(&c, "astrub");
+        al.sort();
+        assert_eq!(al, vec!["classic".to_string(), "sync".to_string()]);
+        assert!(list_aliases(&c, "nope").is_empty());
     }
 
     #[test]
