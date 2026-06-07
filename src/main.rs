@@ -12,13 +12,23 @@
 // logical namespace over one shared bus (~/.agent-bus/bus.db): same-team is the default
 // scope, cross-team is addressable explicitly. A2A-shaped (task_id + lifecycle state).
 
+use inquire::{Select, Text};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+fn version_string() -> String {
+    format!(
+        "agent-bus {} (git {}, built {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("AGENT_BUS_GIT"),
+        env!("AGENT_BUS_BUILD")
+    )
+}
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS messages (
@@ -415,6 +425,7 @@ fn cli_teams() {
 }
 
 // ---------------------------------------------------------------- installer / wizard
+// plain stdin prompts (used as the non-TTY fallback)
 fn prompt(label: &str, default: &str) -> String {
     print!("{} [{}]: ", label, default);
     io::stdout().flush().ok();
@@ -436,6 +447,38 @@ fn choose(label: &str, options: &[&str], default: &str) -> String {
     }
     pick
 }
+
+// interactive helpers: a polished inquire menu/input when on a TTY, plain fallback otherwise
+fn is_tty() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+fn ask_select(label: &str, options: &[String], default: &str, help: Option<&str>) -> String {
+    if is_tty() {
+        let start = options.iter().position(|o| o == default).unwrap_or(0);
+        let mut s = Select::new(label, options.to_vec()).with_starting_cursor(start);
+        if let Some(h) = help {
+            s = s.with_help_message(h);
+        }
+        s.prompt().unwrap_or_else(|_| default.to_string())
+    } else {
+        let refs: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
+        choose(label, &refs, default)
+    }
+}
+fn ask_text(label: &str, default: &str, help: Option<&str>) -> String {
+    if is_tty() {
+        let mut t = Text::new(label).with_default(default);
+        if let Some(h) = help {
+            t = t.with_help_message(h);
+        }
+        match t.prompt() {
+            Ok(s) if !s.trim().is_empty() => s,
+            _ => default.to_string(),
+        }
+    } else {
+        prompt(label, default)
+    }
+}
 // guess team/alias from a repo dir name: "astrub-classic" -> ("astrub","classic")
 fn guess_identity(name: &str) -> (String, String) {
     match name.split_once('-') {
@@ -447,26 +490,33 @@ fn basename(path: &str) -> String {
     PathBuf::from(path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "agent".into())
 }
 
-// registry-aware pickers: show what teams/aliases already exist so you choose from
-// reality instead of guessing. The path-guess is just the default.
-fn pick_team(conn: &Connection, default: &str) -> String {
+// registry-aware pickers: choose from teams/aliases that already exist (the bus IS the
+// registry), with the path-guess as the default. Polished inquire menus on a TTY.
+fn choose_team(conn: &Connection, default: &str) -> String {
     let teams = list_teams(conn);
     if teams.is_empty() {
-        println!("(no teams yet — you're creating the first one)");
+        return ask_text("Team (logical group)", default, Some("first team — pick a name (e.g. astrub)"));
+    }
+    let counts = teams.iter().map(|(t, n)| format!("{}:{}", t, n)).collect::<Vec<_>>().join("  ");
+    let create = "+ create a new team".to_string();
+    let mut opts: Vec<String> = teams.iter().map(|(t, _)| t.clone()).collect();
+    opts.push(create.clone());
+    let start = if teams.iter().any(|(t, _)| t == default) { default } else { &create };
+    let chosen = ask_select("Team", &opts, start, Some(&format!("existing: {}", counts)));
+    if chosen == create {
+        ask_text("New team name", default, None)
     } else {
-        println!("Existing teams:");
-        for (t, n) in &teams {
-            println!("  - {} ({} agent{})", t, n, if *n == 1 { "" } else { "s" });
-        }
+        chosen
     }
-    prompt("Team (logical group)", default)
 }
-fn pick_alias(conn: &Connection, team: &str, default: &str) -> String {
+fn choose_alias(conn: &Connection, team: &str, default: &str) -> String {
     let al = list_aliases(conn, team);
-    if !al.is_empty() {
-        println!("Agents already in '{}': {}", team, al.join(", "));
-    }
-    let a = prompt("Alias (this agent's name)", default);
+    let help = if al.is_empty() {
+        format!("first agent in '{}'", team)
+    } else {
+        format!("already in '{}': {}", team, al.join(", "))
+    };
+    let a = ask_text("Alias (this agent's name)", default, Some(&help));
     if al.iter().any(|x| x == &a) {
         println!("note: {}/{} already exists — installing reuses that identity", team, a);
     }
@@ -474,18 +524,23 @@ fn pick_alias(conn: &Connection, team: &str, default: &str) -> String {
 }
 
 fn wizard() {
-    println!("agent-bus — setup\n");
-    let tool = choose("Which tool is this for", &["claude", "codex", "copilot"], "claude");
+    println!("◆ agent-bus setup — {}\n", version_string());
+    let tool = ask_select(
+        "Which tool is this for?",
+        &["claude".into(), "codex".into(), "copilot".into()],
+        "claude",
+        Some("the agent CLI that will run this bus"),
+    );
     let cwd = std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| ".".into());
     let repo = if tool == "claude" {
-        prompt("Target repo path", &cwd)
+        ask_text("Target repo path", &cwd, Some("where to write .mcp.json + CLAUDE.md"))
     } else {
         cwd.clone()
     };
     let (gt, ga) = guess_identity(&basename(&repo));
     let conn = open_db();
-    let team = pick_team(&conn, &gt);
-    let alias = pick_alias(&conn, &team, &ga);
+    let team = choose_team(&conn, &gt);
+    let alias = choose_alias(&conn, &team, &ga);
     apply_install(&tool, &team, &alias, &repo);
 }
 
@@ -495,12 +550,14 @@ fn install(flags: &HashMap<String, String>) {
         return wizard();
     }
     let cwd = std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| ".".into());
-    let tool = flags.get("tool").cloned().unwrap_or_else(|| choose("Tool", &["claude", "codex", "copilot"], "claude"));
-    let repo = flags.get("repo").cloned().unwrap_or_else(|| if tool == "claude" { prompt("Target repo path", &cwd) } else { cwd.clone() });
+    let tool = flags.get("tool").cloned().unwrap_or_else(|| {
+        ask_select("Which tool is this for?", &["claude".into(), "codex".into(), "copilot".into()], "claude", None)
+    });
+    let repo = flags.get("repo").cloned().unwrap_or_else(|| if tool == "claude" { ask_text("Target repo path", &cwd, None) } else { cwd.clone() });
     let (gt, ga) = guess_identity(&basename(&repo));
     let conn = open_db();
-    let team = flags.get("team").cloned().unwrap_or_else(|| pick_team(&conn, &gt));
-    let alias = flags.get("alias").cloned().unwrap_or_else(|| pick_alias(&conn, &team, &ga));
+    let team = flags.get("team").cloned().unwrap_or_else(|| choose_team(&conn, &gt));
+    let alias = flags.get("alias").cloned().unwrap_or_else(|| choose_alias(&conn, &team, &ga));
     apply_install(&tool, &team, &alias, &repo);
 }
 
@@ -670,6 +727,7 @@ fn main() {
         "peers" => cli_peers(&flags),
         "teams" => cli_teams(),
         "register" => cli_register(&flags),
+        "version" | "--version" | "-V" => println!("{}", version_string()),
         "" | "setup" => wizard(),
         _ => {
             eprintln!(
