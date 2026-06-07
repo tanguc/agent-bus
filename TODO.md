@@ -1,7 +1,6 @@
 # agent-bus — backlog
 
-POC is working (serve/install/send/poll/peers/teams, wizard, version). Below is the
-QoL + hardening backlog, roughly priority-ordered. Nothing here blocks current use.
+v0.2.0 shipped (2026-06-07): peek, tasks, prune, whoami, doctor, self-echo fix, receipts, --unread.
 
 ## Prompting / wizard QoL
 - [ ] Wizard: optional `--card` / "describe this agent" step (capability card at setup).
@@ -10,23 +9,26 @@ QoL + hardening backlog, roughly priority-ordered. Nothing here blocks current u
 - [ ] `--yes` / non-interactive guard so CI never blocks on a prompt.
 
 ## New commands
-- [ ] `whoami` — print this shell's resolved team/alias + db path + config source.
-- [ ] `doctor` — checks: bus.db reachable, binary on PATH, .mcp.json present + points here,
-      .claude/settings.local.json has enabledMcpjsonServers, stale-last_seen warnings.
+- [x] `whoami` — team/alias, db path, config source. (v0.2.0)
+- [x] `doctor` — bus.db reachable, binary on PATH, .mcp.json, enabledMcpjsonServers, stale peers, open tasks. (v0.2.0)
 - [ ] `roster` — alias for `peers --team <mine>` (friendlier name).
-- [ ] `unregister` / `prune` — drop a peer; prune peers with last_seen older than N.
+- [ ] `unregister` — drop a peer from the registry.
 
 ## Bugs / warts
-- [ ] Team/global broadcast (`to:"team:X"` / `"all"` / `"*"`) is delivered back to the SENDER
-      on poll (recipient_alias='*' matches the sender too). Harmless self-echo, but noisy —
-      exclude `sender_team/sender_alias` from a broadcast recipient's poll. (found 2026-06-07)
-- [ ] `version` shows `-dirty` from build.rs `git status` — fine, but ensure release installs
-      are built from a clean tree (task install after commit).
+- [x] Team/global broadcast self-echo excluded from poll results. (v0.2.0)
+- [x] Bootstrap block: poll immediately on session start to drain restart backlog. (v0.2.0)
+- [x] Bootstrap block: cross-platform stat (macOS -f %m || Linux -c %Y). (v0.2.0)
+- [ ] `version` shows `-dirty` from build.rs — build from clean tree before releasing.
 
 ## Wake / delivery
+- [x] Receipts: poll writes read receipts; peek shows read_by list; peers --unread. (v0.2.0)
+- [x] Message TTL / retention: `prune --days N`. (v0.2.0)
 - [ ] Ship an `fswatch ~/.agent-bus/inbox/<team>/<alias>.flag` wrapper for Codex/Copilot
       (they have no Monitor). Document the poll-at-turn fallback.
-- [ ] Message TTL / retention: prune delivered messages older than N days to keep bus.db small.
+
+## Read-only / task visibility
+- [x] `peek [--limit N] [--task-id id] [--since-id N]` — read-only, no cursor advance. (v0.2.0)
+- [x] `tasks [--filter all|open|mine|for-me]` — task rollup by task_id. (v0.2.0)
 
 ## A2A north side (deferred — see SPEC.md §6)
 - [ ] Speak A2A on the wire (tasks + Agent Cards) when a non-CLI / cross-machine / cross-vendor
@@ -35,13 +37,6 @@ QoL + hardening backlog, roughly priority-ordered. Nothing here blocks current u
 ## Cutover (parallel-trial -> agent-bus primary)
 Owner decision, applied to ALL THREE sessions at once. Preconditions:
 - [x] all three (sync/classic/client) restarted + actively polling (fresh `last_seen`)
-      — classic + client confirmed live + polling; sync active via CLI (2026-06-07)
-- [x] a real client -> classic -> client round-trip succeeds over the bus (same task_id)
-      — LANDED 2026-06-07: client tasks 7ba47430 + b0cbe5c0 -> classic working/completed
-        on same task_ids -> client confirmed, referenced fix commits 42201e7, 06a31a2.
-        Bus-only, no .md. Two real server bugs fixed over the bus.
-- [ ] OWNER DECISION (the only remaining gate): formalize bus-primary across all three.
-      Current drift to reconcile: client is already BUS-ONLY (owner-directed); classic +
-      sync are still dual. Decide: (a) decommission `.md` auto-monitoring/docs in sync +
-      classic too -> bus is the one channel; or (b) re-align client to dual.
-      Recommendation: (a) — the bus is proven load-bearing and client already moved.
+- [x] real client -> classic -> client round-trip over the bus (2026-06-07)
+- [ ] OWNER DECISION: classic still dual (.md + bus). Recommend: cut classic to bus-only
+      (bus is proven, client already bus-only, sync bus-only). Or keep dual indefinitely.
