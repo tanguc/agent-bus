@@ -1,18 +1,19 @@
 # agent-bus — backlog
 
+v0.2.1 shipped (2026-06-07): unregister, roster, wizard card+confirm, fswatch wrapper.
 v0.2.0 shipped (2026-06-07): peek, tasks, prune, whoami, doctor, self-echo fix, receipts, --unread.
 
 ## Prompting / wizard QoL
-- [ ] Wizard: optional `--card` / "describe this agent" step (capability card at setup).
-- [ ] Wizard: final confirm screen ("write .mcp.json + CLAUDE.md + register? y/N") before applying.
+- [x] Wizard: `--card` step — asks capability card before writing config. (v0.2.1)
+- [x] Wizard: confirm screen (tool/repo/id/card summary + Apply/Cancel). (v0.2.1)
 - [ ] Team Select already fuzzy-filters (inquire) — document it; consider showing agent counts inline.
 - [ ] `--yes` / non-interactive guard so CI never blocks on a prompt.
 
 ## New commands
 - [x] `whoami` — team/alias, db path, config source. (v0.2.0)
 - [x] `doctor` — bus.db reachable, binary on PATH, .mcp.json, enabledMcpjsonServers, stale peers, open tasks. (v0.2.0)
-- [ ] `roster` — alias for `peers --team <mine>` (friendlier name).
-- [ ] `unregister` — drop a peer from the registry.
+- [x] `roster` — alias for `peers` scoped to my team. (v0.2.1)
+- [x] `unregister [--as a] [--team t]` — drop a peer from the registry. (v0.2.1)
 
 ## Bugs / warts
 - [x] Team/global broadcast self-echo excluded from poll results. (v0.2.0)
@@ -23,8 +24,7 @@ v0.2.0 shipped (2026-06-07): peek, tasks, prune, whoami, doctor, self-echo fix, 
 ## Wake / delivery
 - [x] Receipts: poll writes read receipts; peek shows read_by list; peers --unread. (v0.2.0)
 - [x] Message TTL / retention: `prune --days N`. (v0.2.0)
-- [ ] Ship an `fswatch ~/.agent-bus/inbox/<team>/<alias>.flag` wrapper for Codex/Copilot
-      (they have no Monitor). Document the poll-at-turn fallback.
+- [x] `scripts/bus-watch.sh` — fswatch/inotifywait doorbell; falls back to poll loop. (v0.2.1)
 
 ## Read-only / task visibility
 - [x] `peek [--limit N] [--task-id id] [--since-id N]` — read-only, no cursor advance. (v0.2.0)
