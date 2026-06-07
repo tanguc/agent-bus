@@ -500,7 +500,33 @@ fn install_claude(repo: &str, team: &str, alias: &str, exe: &str) {
     let updated = upsert_block(&existing, &bootstrap_block(team, alias));
     fs::write(&cm, updated).expect("write CLAUDE.md");
     println!("✓ wrote agent-bus bootstrap into {}", cm.display());
-    println!("→ restart the Claude Code session in {} and approve the agent-bus MCP prompt", repo);
+
+    enable_mcp_setting(repo);
+    println!("→ restart the Claude Code session in {} (no approval prompt — auto-enabled)", repo);
+}
+
+// auto-approve the agent-bus project MCP server so Claude Code skips the
+// "New MCP server found, approve?" prompt. Targeted (just agent-bus), personal
+// (settings.local.json, gitignored), merge-safe.
+fn enable_mcp_setting(repo: &str) {
+    let dir = PathBuf::from(repo).join(".claude");
+    fs::create_dir_all(&dir).ok();
+    let path = dir.join("settings.local.json");
+    let mut root: Value = if path.exists() {
+        serde_json::from_str(&fs::read_to_string(&path).unwrap_or_default()).unwrap_or(json!({}))
+    } else {
+        json!({})
+    };
+    if !root.is_object() {
+        root = json!({});
+    }
+    let mut names = root["enabledMcpjsonServers"].as_array().cloned().unwrap_or_default();
+    if !names.iter().any(|v| v == "agent-bus") {
+        names.push(json!("agent-bus"));
+    }
+    root["enabledMcpjsonServers"] = json!(names);
+    fs::write(&path, serde_json::to_string_pretty(&root).unwrap() + "\n").ok();
+    println!("✓ auto-approved agent-bus in {}", path.display());
 }
 
 fn install_codex(team: &str, alias: &str, exe: &str) {

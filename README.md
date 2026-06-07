@@ -49,7 +49,10 @@ agent-bus install --tool claude --team astrub --alias classic --repo ~/Projects/
 agent-bus install --tool codex   --team astrub --alias codexer     # writes ~/.codex/config.toml
 agent-bus install --tool copilot --team astrub --alias copilot      # prints the snippet
 ```
-After installing, **restart that session** and approve the `agent-bus` MCP prompt.
+After installing, just **restart that session** — no approval prompt. The installer
+auto-enables the server by adding `"enabledMcpjsonServers": ["agent-bus"]` to the repo's
+`.claude/settings.local.json` (targeted + personal/gitignored). To approve broadly instead,
+set `"enableAllProjectMcpServers": true` in `~/.claude/settings.json`.
 
 ### What the config looks like (Claude `.mcp.json`)
 ```json
