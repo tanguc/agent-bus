@@ -1,8 +1,2 @@
-# runtime state
-bus.db
-bus.db-wal
-bus.db-shm
-inbox/*.flag
-!inbox/.gitkeep
-__pycache__/
-*.pyc
+/target
+.DS_Store

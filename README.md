@@ -1,83 +1,97 @@
 # agent-bus
 
 A minimal, A2A-shaped message bus for coordinating multiple CLI agent sessions
-(Claude Code, Codex, GitHub Copilot, ...). Zero dependencies — Python stdlib only.
+(Claude Code, Codex, GitHub Copilot, ...). One self-contained Rust binary, one
+shared SQLite file. No daemon, no port: every session runs `agent-bus serve` as
+an MCP server over **stdio**, and they all share `~/.agent-bus/bus.db` (WAL mode).
 
-No daemon, no port: every session runs its own copy of `agent_bus.py` as an MCP
-server over **stdio**, and they all share ONE SQLite file (`bus.db`, WAL mode) on
-disk. Identity is the `AGENT_BUS_ALIAS` env var (`sync`, `classic`, `client`, ...).
+## Build
+```bash
+cargo build --release
+# binary: target/release/agent-bus
+```
+
+## Commands
+```
+agent-bus serve                 MCP stdio server (point a CLI's MCP config at this)
+agent-bus install [...]         interactive installer (writes MCP config + CLAUDE.md bootstrap)
+agent-bus send --to X --body Y [--type task] [--state s] [--task-id id] [--as alias]
+agent-bus poll [--as alias]
+agent-bus peers
+agent-bus register [--card ..] [--as alias]
+```
+
+Identity is `AGENT_BUS_ALIAS` (server) or `--as` (CLI): `sync`, `classic`, `client`, ...
 
 ## Why this shape
 - **South side = MCP** — the one protocol every CLI agent already speaks as a client.
 - **A2A-shaped data model** — messages carry a `task_id` + lifecycle `state`
   (submitted → working → completed/failed), so the wire can grow into the real
-  [A2A](https://a2a-protocol.org) standard later without a schema rewrite. See `SPEC.md`.
-- **Doorbell wake** — on every send the broker touches `inbox/<recipient>.flag`; an
-  external watcher (Claude `Monitor`, `fswatch`) reacts to wake an idle session.
+  [A2A](https://a2a-protocol.org) standard later without a schema rewrite (see `SPEC.md`).
+- **Doorbell wake** — on every send the broker touches `~/.agent-bus/inbox/<recipient>.flag`;
+  an external watcher (Claude `Monitor`, `fswatch`) reacts to wake an idle session.
   Each CLI needs its own small wake-shim — that cost is protocol-independent.
 
-## Tools
-| Tool | Purpose |
-|------|---------|
-| `register(card?)` | register/refresh THIS agent (alias from `AGENT_BUS_ALIAS`) + optional Agent Card |
-| `send(to, body, type?, state?, task_id?)` | send to an alias (or `to:"all"`); `type:"task"` for work requests |
-| `poll()` | fetch new messages addressed to me + broadcasts; advances my cursor |
-| `peers()` | list known agents + last-seen + Agent Card |
+## Install (the easy way)
+Run the installer once per session/tool — it writes the config and, for Claude,
+appends a self-bootstrap block to that repo's `CLAUDE.md`:
+```bash
+# Claude Code repo:
+target/release/agent-bus install --tool claude --alias classic --repo ~/Projects/personal/astrub-classic
+# Codex (writes ~/.codex/config.toml):
+target/release/agent-bus install --tool codex --alias codexer
+# Copilot (prints the snippet to add):
+target/release/agent-bus install --tool copilot --alias copilot
+```
+Run with no flags for interactive prompts. After installing, **restart that session**
+and approve the `agent-bus` MCP prompt.
 
-## Install per tool
-
-### Claude Code
-Add to the project's `.mcp.json` (one block per repo, unique alias, same script path):
+### What the config looks like (Claude `.mcp.json`)
 ```json
 {
   "mcpServers": {
     "agent-bus": {
-      "command": "python3",
-      "args": ["~/agent-bus/agent_bus.py"],
-      "env": { "AGENT_BUS_ALIAS": "sync" }
+      "command": "~/.cargo/bin/agent-bus",
+      "args": ["serve"],
+      "env": { "AGENT_BUS_ALIAS": "classic" }
     }
   }
 }
 ```
-Restart the session (or `/mcp` reconnect) to load it.
 
-### Codex CLI
-`~/.codex/config.toml` (or project `.codex/config.toml`):
-```toml
-[mcp_servers.agent-bus]
-command = "python3"
-args = ["~/agent-bus/agent_bus.py"]
-env = { AGENT_BUS_ALIAS = "codex" }
+## Tools (MCP)
+| Tool | Purpose |
+|------|---------|
+| `register(card?)` | register/refresh THIS agent + optional Agent Card |
+| `send(to, body, type?, state?, task_id?)` | send to an alias (or `to:"all"`); `type:"task"` for work requests |
+| `poll()` | fetch new messages addressed to me + broadcasts; advance cursor |
+| `peers()` | list known agents + last-seen + Agent Card |
+
+## Wake (doorbell) — Claude Code
+The installer's CLAUDE.md block arms this automatically; manually it's:
 ```
-
-### GitHub Copilot (agent mode / CLI)
-Add an MCP server entry pointing at the same script with `AGENT_BUS_ALIAS=copilot`.
-
-## Wake (doorbell) — Claude Code example
+Monitor(persistent:true, timeout_ms:3600000, command: |
+  f=~/.agent-bus/inbox/sync.flag; last=""; while true; do
+    if [ -f $f ]; then m=$(stat -f %m $f 2>/dev/null);
+      if [ "$m" != "$last" ]; then echo "BUS: new mail for sync — call agent-bus poll()"; last="$m"; fi; fi;
+    sleep 2; done)
 ```
-Monitor(description:"agent-bus inbox", persistent:true, timeout_ms:3600000, command: |
-  cd ~/Projects/personal/agent-bus && while true; do
-    if [ -f inbox/sync.flag ]; then echo "BUS: new mail for sync — call poll()"; fi
-    sleep 2;
-  done)
-```
-On `BUS:` → call the `poll` tool. (Codex/Copilot: call `poll()` at turn start, or run
-`fswatch inbox/<alias>.flag`.)
+Codex/Copilot: no background watcher — call `poll()` at the start of each turn, or run
+`fswatch ~/.agent-bus/inbox/<alias>.flag` in a terminal.
 
-## Config
+## Config / state
 - `AGENT_BUS_ALIAS` — this session's identity (default `unknown`).
-- `AGENT_BUS_DB` — override the SQLite path (default `<repo>/bus.db`).
-
-## Storage (gitignored)
-- `bus.db` — SQLite: messages, cursors, peers.
-- `inbox/*.flag` — per-recipient doorbells.
-
-## Status
-POC, verified end-to-end over the real MCP stdio protocol: cross-session send/poll,
-task-id reply lifecycle, peer discovery, doorbell. Deferred (see `SPEC.md` §6): A2A
-north side, cross-machine, auth, signed Agent Cards, SSE streaming.
+- `AGENT_BUS_HOME` — state dir (default `~/.agent-bus`).
+- `AGENT_BUS_DB` — SQLite path (default `$AGENT_BUS_HOME/bus.db`).
+- State (`bus.db`, `inbox/*.flag`) lives under `~/.agent-bus/` — never in a project repo.
 
 ## Test
 ```bash
-python3 selftest.py
+cargo test
 ```
+Covers the A2A task round-trip + lifecycle, late-registration delivery, cursor drain,
+peers/broadcast, and the MCP initialize/tools-list handshake.
+
+## Status
+POC, verified end-to-end (cargo test + live MCP stdio + CLI). Deferred (see `SPEC.md` §6):
+A2A north side, cross-machine, auth, signed Agent Cards, SSE streaming.

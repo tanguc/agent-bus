@@ -1,0 +1,16 @@
+[package]
+name = "agent-bus"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal A2A-shaped MCP message broker for coordinating CLI agent sessions"
+
+[[bin]]
+name = "agent-bus"
+path = "src/main.rs"
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
