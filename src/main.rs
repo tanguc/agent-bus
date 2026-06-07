@@ -414,6 +414,18 @@ fn tool_prune(conn: &Connection, args: &Value) -> rusqlite::Result<Value> {
     Ok(json!({"ok": true, "deleted": n, "days": days}))
 }
 
+fn tool_unregister(conn: &Connection, team: &str, alias: &str, args: &Value) -> rusqlite::Result<Value> {
+    let target_team  = args["team"].as_str().unwrap_or(team);
+    let target_alias = args["alias"].as_str()
+        .or_else(|| args["as"].as_str())
+        .unwrap_or(alias);
+    let n = conn.execute(
+        "DELETE FROM peers WHERE team=?1 AND alias=?2",
+        params![target_team, target_alias],
+    )?;
+    Ok(json!({"ok": true, "removed": n > 0, "id": format!("{}/{}", target_team, target_alias)}))
+}
+
 fn tool_peers(conn: &Connection, my_team: &str, args: &Value) -> rusqlite::Result<Value> {
     let filter     = args["team"].as_str().unwrap_or(my_team);
     let show_unread = args["unread"].as_bool().unwrap_or(false);
@@ -501,6 +513,7 @@ fn call_tool(conn: &Connection, team: &str, alias: &str, name: &str, args: &Valu
         "tasks"             => tool_tasks(conn, team, alias, args),
         "peers"             => tool_peers(conn, team, args),
         "prune"             => tool_prune(conn, args),
+        "unregister"        => tool_unregister(conn, team, alias, args),
         _ => return json!({"ok": false, "error": format!("unknown tool: {}", name)}),
     };
     match r {
@@ -561,6 +574,14 @@ fn tools_list() -> Value {
             "description": "Delete messages older than N days (default 30). Returns count deleted.",
             "inputSchema": {"type":"object","properties":{
                 "days": {"type":"integer","description":"messages older than this many days are deleted"}
+            }}
+        },
+        {
+            "name": "unregister",
+            "description": "Remove a peer from the registry. Defaults to self. Specify team/alias to remove another agent.",
+            "inputSchema": {"type":"object","properties":{
+                "team":  {"type":"string","description":"team of the peer to remove (default: my team)"},
+                "alias": {"type":"string","description":"alias of the peer to remove (default: me)"}
             }}
         }
     ])
@@ -694,6 +715,13 @@ fn cli_prune(flags: &HashMap<String, String>) {
         if let Ok(n) = v.parse::<i64>() { args["days"] = json!(n); }
     }
     println!("{}", call_tool(&conn, &cli_team(flags), &cli_alias(flags), "prune", &args));
+}
+fn cli_unregister(flags: &HashMap<String, String>) {
+    let conn = open_db();
+    let mut args = json!({});
+    if let Some(t) = flags.get("team")  { args["team"]  = json!(t); }
+    if let Some(a) = flags.get("as").or_else(|| flags.get("alias")) { args["alias"] = json!(a); }
+    println!("{}", call_tool(&conn, &cli_team(flags), &cli_alias(flags), "unregister", &args));
 }
 fn cli_whoami(flags: &HashMap<String, String>) {
     let team  = cli_team(flags);
@@ -909,7 +937,31 @@ fn wizard() {
     let conn = open_db();
     let team  = choose_team(&conn, &gt);
     let alias = choose_alias(&conn, &team, &ga);
-    apply_install(&tool, &team, &alias, &repo);
+    let card_raw = ask_text(
+        "Capability card (optional)",
+        "",
+        Some("describe what this agent does — shown in 'peers' roster"),
+    );
+    let card: Option<String> = if card_raw.trim().is_empty() { None } else { Some(card_raw) };
+
+    // confirm screen
+    println!("\n  tool:  {}", tool);
+    println!("  repo:  {}", repo);
+    println!("  id:    {}/{}", team, alias);
+    if let Some(ref c) = card { println!("  card:  {}", c); }
+    println!();
+    let confirm = ask_select(
+        "Apply?",
+        &["Yes — write config files".into(), "No — cancel".into()],
+        "Yes — write config files",
+        None,
+    );
+    if confirm.starts_with("No") {
+        println!("aborted — no files written.");
+        return;
+    }
+
+    apply_install(&tool, &team, &alias, &repo, card.as_deref());
 }
 
 fn install(flags: &HashMap<String, String>) {
@@ -927,10 +979,11 @@ fn install(flags: &HashMap<String, String>) {
     let conn  = open_db();
     let team  = flags.get("team").cloned().unwrap_or_else(|| choose_team(&conn, &gt));
     let alias = flags.get("alias").cloned().unwrap_or_else(|| choose_alias(&conn, &team, &ga));
-    apply_install(&tool, &team, &alias, &repo);
+    let card  = flags.get("card").map(|s| s.as_str());
+    apply_install(&tool, &team, &alias, &repo, card);
 }
 
-fn apply_install(tool: &str, team: &str, alias: &str, repo: &str) {
+fn apply_install(tool: &str, team: &str, alias: &str, repo: &str, card: Option<&str>) {
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "agent-bus".into());
@@ -943,8 +996,10 @@ fn apply_install(tool: &str, team: &str, alias: &str, repo: &str) {
             return;
         }
     }
+    let card_val = card.map(|s| s.to_string())
+        .unwrap_or_else(|| format!("installed for {}", tool));
     let conn = open_db();
-    let _ = tool_register(&conn, team, alias, &json!({"card": format!("installed for {}", tool)}));
+    let _ = tool_register(&conn, team, alias, &json!({"card": card_val}));
     println!("registered {}/{} on the bus", team, alias);
 }
 
@@ -1091,8 +1146,10 @@ fn main() {
         "tasks"               => cli_tasks(&flags),
         "prune"               => cli_prune(&flags),
         "peers"               => cli_peers(&flags),
+        "roster"              => cli_peers(&flags),  // alias: peers scoped to my team (default)
         "teams"               => cli_teams(),
         "register"            => cli_register(&flags),
+        "unregister"          => cli_unregister(&flags),
         "whoami"              => cli_whoami(&flags),
         "doctor"              => cli_doctor(&flags),
         "version" | "--version" | "-V" => println!("{}", version_string()),
@@ -1102,15 +1159,17 @@ fn main() {
              \n\
              setup / (no args)             interactive first-time setup\n\
              serve                         MCP stdio server\n\
-             install [--tool --team --alias --repo]\n\
+             install [--tool --team --alias --repo [--card ..]]\n\
              send --to X --body Y [--type task] [--state s] [--task-id id] [--team t] [--as a]\n\
              poll [--team t] [--as a]\n\
              peek [--limit N] [--task-id id] [--since-id N]   read-only; no cursor advance\n\
              tasks [--filter all|open|mine|for-me]\n\
              prune [--days N]\n\
              peers [--team t|*] [--unread]\n\
+             roster                        alias for peers (my team)\n\
              teams\n\
              register [--card ..] [--team t] [--as a]\n\
+             unregister [--as a] [--team t]\n\
              whoami\n\
              doctor\n\
              version"
@@ -1333,6 +1392,6 @@ mod tests {
         assert_eq!(resp["result"]["serverInfo"]["name"], "agent-bus");
         assert!(handle(&c, "astrub", "sync", &json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none());
         let resp = handle(&c, "astrub", "sync", &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
-        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 8);
     }
 }
