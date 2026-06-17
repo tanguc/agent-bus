@@ -468,6 +468,7 @@ fn tool_peers(conn: &Connection, my_team: &str, args: &Value) -> rusqlite::Resul
                         "SELECT COUNT(*) FROM messages m \
                          WHERE ((m.recipient_team=?1 AND (m.recipient_alias=?2 OR m.recipient_alias='*')) \
                                 OR (m.recipient_team='*' AND m.recipient_alias='*')) \
+                         AND NOT (m.sender_team=?1 AND m.sender_alias=?2) \
                          AND NOT EXISTS (\
                            SELECT 1 FROM receipts r \
                            WHERE r.message_id=m.id AND r.reader_team=?1 AND r.reader_alias=?2)",
@@ -543,7 +544,9 @@ fn tools_list() -> Value {
         {
             "name": "poll",
             "description": "Fetch new messages since last poll; advances cursor. Excludes broadcast self-echo. Writes receipts.",
-            "inputSchema": {"type":"object","properties":{}}
+            "inputSchema": {"type":"object","properties":{
+                "ack": {"type":"string","description":"optional, ignored — reserved; lets clients emit a well-formed arg"}
+            }}
         },
         {
             "name": "peek",
@@ -984,6 +987,18 @@ fn install(flags: &HashMap<String, String>) {
 }
 
 fn apply_install(tool: &str, team: &str, alias: &str, repo: &str, card: Option<&str>) {
+    let repo_path = PathBuf::from(repo);
+    if !repo_path.join(".git").exists() {
+        eprintln!("error: {} is not a git repository (.git not found)", repo_path.display());
+        eprintln!("       run 'agent-bus install' from inside the target repo, or pass --repo <path>");
+        std::process::exit(1);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    if repo_path.to_string_lossy() == home || repo_path == PathBuf::from(&home) {
+        eprintln!("error: refusing to write config files into your home directory");
+        eprintln!("       target a specific project repo instead");
+        std::process::exit(1);
+    }
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "agent-bus".into());
@@ -1399,6 +1414,31 @@ mod tests {
         let classic = r["peers"].as_array().unwrap().iter()
             .find(|p| p["alias"] == "classic").unwrap();
         assert_eq!(classic["unread"].as_i64().unwrap(), 0);
+    }
+
+    #[test]
+    fn unread_excludes_self_broadcast() {
+        // a peer's own broadcasts must not count against its own unread:
+        // poll excludes self-echo (never receipts them), so unread would be
+        // permanently inflated without the matching exclusion.
+        let c = mem();
+        tool_register(&c, "astrub", "classic", &json!({})).unwrap();
+        tool_register(&c, "astrub", "sync",    &json!({})).unwrap();
+
+        // classic broadcasts to its own team, then drains its inbox
+        tool_send(&c, "astrub", "classic", &json!({"to":"team:astrub","body":"hello team"})).unwrap();
+        tool_poll(&c, "astrub", "classic").unwrap();
+
+        let r = tool_peers(&c, "astrub", &json!({"unread": true})).unwrap();
+        let classic = r["peers"].as_array().unwrap().iter()
+            .find(|p| p["alias"] == "classic").unwrap();
+        // self-echo excluded from poll -> must also be excluded from unread
+        assert_eq!(classic["unread"].as_i64().unwrap(), 0);
+
+        // sanity: sync (a real recipient) still sees it as unread
+        let sync = r["peers"].as_array().unwrap().iter()
+            .find(|p| p["alias"] == "sync").unwrap();
+        assert_eq!(sync["unread"].as_i64().unwrap(), 1);
     }
 
     #[test]
