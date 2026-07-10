@@ -1,6 +1,6 @@
 [package]
 name = "agent-bus"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 description = "Minimal A2A-shaped MCP message broker for coordinating CLI agent sessions"
 

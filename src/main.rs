@@ -1010,9 +1010,16 @@ fn cli_prune(flags: &HashMap<String, String>) {
     }
     emit("prune", &call_tool(&conn, &cli_team(flags), &cli_alias(flags), "prune", &args), flags);
 }
-fn cli_unregister(flags: &HashMap<String, String>) {
+fn cli_unregister(flags: &HashMap<String, String>, pos: &[String]) {
     let conn = open_db();
     let mut args = json!({});
+    // positional target: `alias` or `team/alias`; explicit flags win over it
+    if let Some(p) = pos.first() {
+        match p.split_once('/') {
+            Some((t, a)) => { args["team"] = json!(t); args["alias"] = json!(a); }
+            None         => { args["alias"] = json!(p); }
+        }
+    }
     if let Some(t) = flags.get("team")  { args["team"]  = json!(t); }
     if let Some(a) = flags.get("as").or_else(|| flags.get("alias")) { args["alias"] = json!(a); }
     emit("unregister", &call_tool(&conn, &cli_team(flags), &cli_alias(flags), "unregister", &args), flags);
@@ -1691,22 +1698,95 @@ Monitor(persistent:true, timeout_ms:3600000, command: |\n\
 }
 
 // ---------------------------------------------------------------- arg parsing
-fn parse_flags(args: &[String]) -> HashMap<String, String> {
+// positionals used to be silently discarded, so `unregister foo --team t` dropped
+// `foo` and fell back to the caller's own alias — deleting the wrong peer
+// valueless flags must not swallow the next token, or `--unread foo` eats `foo`
+const BOOL_FLAGS: &[&str] = &["json", "help", "h", "unread", "no-interactive"];
+
+fn parse_args(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
     let mut m = HashMap::new();
+    let mut pos = Vec::new();
     let mut i = 0;
     while i < args.len() {
         if let Some(key) = args[i].strip_prefix("--") {
-            let val = if i + 1 < args.len() && !args[i + 1].starts_with("--") {
-                i += 1;
-                args[i].clone()
-            } else {
-                "true".into()
-            };
+            let takes_value = !BOOL_FLAGS.contains(&key)
+                && i + 1 < args.len()
+                && !args[i + 1].starts_with("--");
+            let val = if takes_value { i += 1; args[i].clone() } else { "true".into() };
             m.insert(key.to_string(), val);
+        } else {
+            pos.push(args[i].clone());
         }
         i += 1;
     }
-    m
+    (m, pos)
+}
+
+#[cfg(test)]
+fn parse_flags(args: &[String]) -> HashMap<String, String> { parse_args(args).0 }
+
+// reject typo'd flags and stray arguments rather than acting on a wrong target
+fn guard(cmd: &str, flags: &HashMap<String, String>, pos: &[String], allowed: &[&str], max_pos: usize) {
+    for k in flags.keys() {
+        if k == "json" { continue; }
+        if !allowed.contains(&k.as_str()) {
+            eprintln!("error: unknown flag `--{}` for `agent-bus {}`", k, cmd);
+            eprintln!("       try `agent-bus {} --help`", cmd);
+            std::process::exit(2);
+        }
+    }
+    if pos.len() > max_pos {
+        eprintln!("error: unexpected argument `{}` for `agent-bus {}`", pos[max_pos], cmd);
+        eprintln!("       try `agent-bus {} --help`", cmd);
+        std::process::exit(2);
+    }
+}
+
+// (allowed flags, max positional args) per command
+fn spec(cmd: &str) -> (&'static [&'static str], usize) {
+    match cmd {
+        "serve"                => (&[], 0),
+        "install"              => (&["tool", "team", "alias", "repo", "card"], 0),
+        "send"                 => (&["to", "body", "type", "state", "task-id", "team", "as"], 0),
+        "poll"                 => (&["team", "as"], 0),
+        "peek" | "history"     => (&["limit", "task-id", "since-id", "team", "as"], 0),
+        "tasks"                => (&["filter", "team", "as"], 0),
+        "prune"                => (&["days", "team", "as"], 0),
+        "peers" | "roster"     => (&["team", "unread"], 0),
+        "teams"                => (&["no-interactive"], 0),
+        "register"             => (&["card", "team", "as"], 0),
+        "unregister"           => (&["team", "as", "alias"], 1), // positional: alias or team/alias
+        "whoami"               => (&["team", "as"], 0),
+        "doctor"               => (&[], 0),
+        _                      => (&[], 0),
+    }
+}
+
+fn usage() -> &'static str {
+    "agent-bus <command>\n\
+     \n\
+     setup / (no args)             interactive first-time setup\n\
+     serve                         MCP stdio server\n\
+     install [--tool --team --alias --repo [--card ..]]\n\
+     send --to X --body Y [--type task] [--state s] [--task-id id] [--team t] [--as a]\n\
+     poll [--team t] [--as a]\n\
+     peek [--limit N] [--task-id id] [--since-id N]   read-only; no cursor advance\n\
+     tasks [--filter all|open|mine|for-me]\n\
+     prune [--days N]\n\
+     peers [--team t|*] [--unread]\n\
+     roster                        alias for peers (my team)\n\
+     teams [--no-interactive]      list teams; on a tty, offers to create one\n\
+     register [--card ..] [--team t] [--as a]\n\
+     unregister [alias | team/alias]    defaults to self if no target given\n\
+     whoami\n\
+     doctor\n\
+     version\n\
+     \n\
+     --help    show this message           --json    print the raw JSON object\n\
+     \n\
+     install writes the bootstrap to CLAUDE.local.md and adds\n\
+     .mcp.json/CLAUDE.local.md/.claude to the repo's .git/info/exclude;\n\
+     set AGENT_BUS_NO_GIT_EXCLUDE=1 to skip that"
 }
 
 fn main() {
@@ -1716,8 +1796,32 @@ fn main() {
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
 
     let argv: Vec<String> = std::env::args().collect();
-    let cmd   = argv.get(1).map(|s| s.as_str()).unwrap_or("");
-    let flags = parse_flags(&argv[2.min(argv.len())..]);
+    let cmd = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+    let (flags, pos) = parse_args(&argv[2.min(argv.len())..]);
+
+    // --help anywhere wins, before any command runs or any prompt opens
+    if matches!(cmd, "help" | "--help" | "-h") || flags.contains_key("help") || flags.contains_key("h") {
+        println!("{}", usage());
+        return;
+    }
+
+    // reject an unknown command before validating its flags, or the error misleads
+    const COMMANDS: &[&str] = &[
+        "", "setup", "serve", "install", "send", "poll", "peek", "history", "tasks",
+        "prune", "peers", "roster", "teams", "register", "unregister", "whoami",
+        "doctor", "version", "--version", "-V",
+    ];
+    if !COMMANDS.contains(&cmd) {
+        eprintln!("error: unknown command `{}`\n", cmd);
+        eprintln!("{}", usage());
+        std::process::exit(2);
+    }
+
+    if !matches!(cmd, "" | "setup" | "version" | "--version" | "-V") {
+        let (allowed, max_pos) = spec(cmd);
+        guard(cmd, &flags, &pos, allowed, max_pos);
+    }
+
     match cmd {
         "serve"               => serve(),
         "install"             => install(&flags),
@@ -1730,36 +1834,16 @@ fn main() {
         "roster"              => cli_peers(&flags),  // alias: peers scoped to my team (default)
         "teams"               => cli_teams(&flags),
         "register"            => cli_register(&flags),
-        "unregister"          => cli_unregister(&flags),
+        "unregister"          => cli_unregister(&flags, &pos),
         "whoami"              => cli_whoami(&flags),
         "doctor"              => cli_doctor(&flags),
         "version" | "--version" | "-V" => println!("{}", version_string()),
         "" | "setup"          => wizard(),
-        _ => eprintln!(
-            "agent-bus <command>\n\
-             \n\
-             setup / (no args)             interactive first-time setup\n\
-             serve                         MCP stdio server\n\
-             install [--tool --team --alias --repo [--card ..]]\n\
-             send --to X --body Y [--type task] [--state s] [--task-id id] [--team t] [--as a]\n\
-             poll [--team t] [--as a]\n\
-             peek [--limit N] [--task-id id] [--since-id N]   read-only; no cursor advance\n\
-             tasks [--filter all|open|mine|for-me]\n\
-             prune [--days N]\n\
-             peers [--team t|*] [--unread]\n\
-             roster                        alias for peers (my team)\n\
-             teams [--no-interactive]      list teams; on a tty, offers to create one\n\
-             register [--card ..] [--team t] [--as a]\n\
-             unregister [--as a] [--team t]\n\
-             whoami\n\
-             doctor\n\
-             version\n\
-             \n\
-             --json    print the raw JSON object instead of formatted output\n\
-             \n\
-             install adds .mcp.json/CLAUDE.md/.claude to the repo's .git/info/exclude;\n\
-             set AGENT_BUS_NO_GIT_EXCLUDE=1 to skip that"
-        ),
+        other => {
+            eprintln!("error: unknown command `{}`\n", other);
+            eprintln!("{}", usage());
+            std::process::exit(2);
+        }
     }
 }
 
@@ -1947,6 +2031,46 @@ mod tests {
         let classic = r["peers"].as_array().unwrap().iter()
             .find(|p| p["alias"] == "classic").unwrap();
         assert_eq!(classic["unread"].as_i64().unwrap(), 0);
+    }
+
+    fn argv(s: &[&str]) -> Vec<String> { s.iter().map(|x| x.to_string()).collect() }
+
+    #[test]
+    fn parse_args_keeps_positionals() {
+        let (f, p) = parse_args(&argv(&["infra-repo", "--team", "home-infra"]));
+        assert_eq!(p, vec!["infra-repo"]);
+        assert_eq!(f.get("team").map(String::as_str), Some("home-infra"));
+
+        // flag-before-positional, and valueless flags
+        let (f, p) = parse_args(&argv(&["--team", "t", "--unread", "extra"]));
+        assert_eq!(p, vec!["extra"]);
+        assert_eq!(f.get("unread").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn unregister_targets_the_named_peer_not_self() {
+        // `unregister infra-repo --team home-infra` must delete home-infra/infra-repo,
+        // never the caller's own identity (the positional used to be discarded)
+        let c = mem();
+        tool_register(&c, "home-infra", "infra-repo", &json!({})).unwrap();
+        tool_register(&c, "home-infra", "me", &json!({})).unwrap();
+
+        let (_, pos) = parse_args(&argv(&["infra-repo", "--team", "home-infra"]));
+        let mut args = json!({});
+        if let Some(p) = pos.first() { args["alias"] = json!(p); }
+        args["team"] = json!("home-infra");
+
+        let r = tool_unregister(&c, "home-infra", "me", &args).unwrap();
+        assert_eq!(r["id"], "home-infra/infra-repo");
+        assert_eq!(r["removed"], true);
+        assert!(peer_exists(&c, "home-infra", "me"), "caller must survive");
+
+        // team/alias form
+        let (_, pos) = parse_args(&argv(&["home-infra/me"]));
+        let (t, a) = pos[0].split_once('/').unwrap();
+        let r = tool_unregister(&c, "x", "y", &json!({"team":t,"alias":a})).unwrap();
+        assert_eq!(r["id"], "home-infra/me");
+        assert_eq!(r["removed"], true);
     }
 
     #[test]
