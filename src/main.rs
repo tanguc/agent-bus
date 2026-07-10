@@ -18,13 +18,13 @@
 // Identity = AGENT_BUS_TEAM/AGENT_BUS_ALIAS (MCP serve) or --team/--as (CLI).
 // A2A-shaped: task_id + lifecycle state (submitted→working→completed|failed).
 
-use inquire::{Select, Text};
+use inquire::{InquireError, Select, Text};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn version_string() -> String {
@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS receipts (
     read_at      INTEGER,
     PRIMARY KEY(message_id, reader_team, reader_alias)
 );
+CREATE TABLE IF NOT EXISTS teams (
+    name       TEXT PRIMARY KEY,
+    created_at INTEGER
+);
+-- teams used to be derived from peers; backfill so existing ones survive the migration
+INSERT OR IGNORE INTO teams(name, created_at) SELECT DISTINCT team, 0 FROM peers;
 ";
 
 // ---------------------------------------------------------------- paths/util
@@ -220,6 +226,7 @@ fn task_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
 // ---------------------------------------------------------------- tools
 fn tool_register(conn: &Connection, team: &str, alias: &str, args: &Value) -> rusqlite::Result<Value> {
     let card = args["card"].as_str();
+    ensure_team(conn, team)?; // registering into a new team creates it
     conn.execute(
         "INSERT INTO peers(team, alias, card, last_seen) VALUES(?1, ?2, ?3, ?4) \
          ON CONFLICT(team, alias) DO UPDATE SET card=COALESCE(?3, peers.card), last_seen=?4",
@@ -248,7 +255,20 @@ fn tool_send(conn: &Connection, team: &str, alias: &str, args: &Value) -> rusqli
     let id = conn.last_insert_rowid();
     mark_seen(conn, team, alias)?;
     touch_doorbell(conn, &rt, &ra, team, alias);
-    Ok(json!({"ok": true, "id": id, "task_id": task_id, "to": format!("{}/{}", rt, ra)}))
+
+    let mut out = json!({"ok": true, "id": id, "task_id": task_id, "to": format!("{}/{}", rt, ra)});
+    // a direct send to an unregistered identity is still delivered if that agent later
+    // registers under it (poll matches on recipient, cursor starts at 0) — but a typo'd
+    // alias is a silent black hole, so surface the ambiguity instead of hiding it
+    if ra != "*" && !peer_exists(conn, &rt, &ra) {
+        out["recipient_registered"] = json!(false);
+        out["warning"] = json!(format!(
+            "no peer '{}/{}' is registered — delivered only if an agent later registers under that exact identity",
+            rt, ra
+        ));
+        out["known_peers"] = json!(all_peer_ids(conn));
+    }
+    Ok(out)
 }
 
 fn tool_poll(conn: &Connection, team: &str, alias: &str) -> rusqlite::Result<Value> {
@@ -375,7 +395,8 @@ fn tool_tasks(conn: &Connection, team: &str, alias: &str, args: &Value) -> rusql
 
     let tasks: Vec<Value> = match filter {
         "open" => {
-            let sql = format!("{} WHERE lm.state NOT IN ('completed','failed') ORDER BY lm.created_at DESC", base);
+            // 'info' is a status state, not open work — must match doctor's open_tasks count
+            let sql = format!("{} WHERE lm.state NOT IN ('completed','failed','info') ORDER BY lm.created_at DESC", base);
             let mut stmt = conn.prepare(&sql)?;
             let x = stmt.query_map([], task_row)?.collect::<rusqlite::Result<Vec<_>>>()?; x
         }
@@ -486,14 +507,48 @@ fn tool_peers(conn: &Connection, my_team: &str, args: &Value) -> rusqlite::Resul
 }
 
 // ---------------------------------------------------------------- registry helpers
+// teams live in their own table, so a team with zero agents still lists (count 0)
 fn list_teams(conn: &Connection) -> Vec<(String, i64)> {
-    let mut stmt = match conn.prepare("SELECT team, COUNT(*) FROM peers GROUP BY team ORDER BY team") {
+    let mut stmt = match conn.prepare(
+        "SELECT t.name, COUNT(p.alias) FROM teams t \
+         LEFT JOIN peers p ON p.team = t.name \
+         GROUP BY t.name ORDER BY t.name",
+    ) {
         Ok(s) => s,
         Err(_) => return vec![],
     };
     stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
         .map(|rows| rows.flatten().collect())
         .unwrap_or_default()
+}
+
+fn peer_exists(conn: &Connection, team: &str, alias: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM peers WHERE team=?1 AND alias=?2",
+        params![team, alias],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|o| o.is_some())
+    .unwrap_or(false)
+}
+
+fn all_peer_ids(conn: &Connection) -> Vec<String> {
+    let mut stmt = match conn.prepare("SELECT team || '/' || alias FROM peers ORDER BY team, alias") {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map([], |r| r.get::<_, String>(0))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+fn ensure_team(conn: &Connection, name: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO teams(name, created_at) VALUES(?1, ?2)",
+        params![name, now_ms()],
+    )?;
+    Ok(())
 }
 fn list_aliases(conn: &Connection, team: &str) -> Vec<String> {
     let mut stmt = match conn.prepare("SELECT alias FROM peers WHERE team=?1 ORDER BY alias") {
@@ -523,6 +578,147 @@ fn call_tool(conn: &Connection, team: &str, alias: &str, name: &str, args: &Valu
     }
 }
 
+// ---------------------------------------------------------------- pretty CLI output
+// every cli command renders human-readable by default; --json restores the raw object
+const PAD: &str = "         "; // aligns continuation lines under "  #1234  "
+
+fn ago(at_ms: i64) -> String {
+    let d = (now_ms() - at_ms).max(0) / 1000;
+    match d {
+        0..=4        => "just now".to_string(),
+        5..=59       => format!("{}s ago", d),
+        60..=3599    => format!("{}m ago", d / 60),
+        3600..=86399 => format!("{}h ago", d / 3600),
+        _            => format!("{}d ago", d / 86400),
+    }
+}
+
+fn ellipsis(s: &str, max: usize) -> String {
+    let flat = s.replace('\n', " ");
+    if flat.chars().count() <= max { return flat; }
+    let head: String = flat.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", head.trim_end())
+}
+
+fn body_block(body: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out: Vec<String> = lines.iter().take(max_lines).map(|l| format!("{}{}", PAD, l)).collect();
+    if lines.len() > max_lines {
+        out.push(format!("{}… (+{} more lines)", PAD, lines.len() - max_lines));
+    }
+    out.join("\n")
+}
+
+fn plural(n: usize) -> &'static str { if n == 1 { "" } else { "s" } }
+
+fn print_msgs(msgs: &[Value]) {
+    for m in msgs {
+        println!(
+            "  #{:<6} {} → {}",
+            m["id"].as_i64().unwrap_or(0),
+            m["from"].as_str().unwrap_or("?"),
+            m["to"].as_str().unwrap_or("?")
+        );
+        let mut meta = vec![m["type"].as_str().unwrap_or("message").to_string()];
+        if let Some(s) = m["state"].as_str()   { if !s.is_empty() { meta.push(s.into()); } }
+        if let Some(t) = m["task_id"].as_str() { if !t.is_empty() { meta.push(format!("task {}", t)); } }
+        meta.push(ago(m["at"].as_i64().unwrap_or(0)));
+        if let Some(rb) = m["read_by"].as_array() {
+            let readers: Vec<&str> = rb.iter().filter_map(|v| v.as_str()).collect();
+            if !readers.is_empty() { meta.push(format!("read by {}", readers.join(", "))); }
+        }
+        println!("{}{}", PAD, meta.join(" · "));
+        let b = m["body"].as_str().unwrap_or("");
+        if !b.trim().is_empty() { println!("{}", body_block(b, 6)); }
+        println!();
+    }
+}
+
+fn emit(cmd: &str, v: &Value, flags: &HashMap<String, String>) {
+    if flags.contains_key("json") { println!("{}", v); return; }
+    if !v["ok"].as_bool().unwrap_or(true) {
+        eprintln!("✗ {}", v["error"].as_str().unwrap_or("unknown error"));
+        std::process::exit(1);
+    }
+    match cmd {
+        "poll" | "peek" => {
+            let msgs = v["messages"].as_array().cloned().unwrap_or_default();
+            if msgs.is_empty() {
+                println!("○ no {}messages", if cmd == "poll" { "new " } else { "" });
+                return;
+            }
+            let kind = if cmd == "poll" { "new message" } else { "message" };
+            println!("● {} {}{}\n", msgs.len(), kind, plural(msgs.len()));
+            print_msgs(&msgs);
+        }
+        "send" => {
+            println!("● sent #{} → {}", v["id"].as_i64().unwrap_or(0), v["to"].as_str().unwrap_or("?"));
+            if let Some(t) = v["task_id"].as_str() { println!("  task {}", t); }
+            if let Some(w) = v["warning"].as_str() {
+                println!("! {}", w);
+                if let Some(k) = v["known_peers"].as_array() {
+                    let ids: Vec<&str> = k.iter().filter_map(|x| x.as_str()).collect();
+                    if !ids.is_empty() { println!("  registered peers: {}", ids.join(", ")); }
+                }
+            }
+        }
+        "register" => println!("● registered {}", v["id"].as_str().unwrap_or("?")),
+        "unregister" => {
+            let id = v["id"].as_str().unwrap_or("?");
+            if v["removed"].as_bool().unwrap_or(false) { println!("● removed {}", id); }
+            else                                       { println!("○ {} was not registered", id); }
+        }
+        "prune" => println!(
+            "● pruned {} message{} older than {}d",
+            v["deleted"].as_i64().unwrap_or(0),
+            plural(v["deleted"].as_i64().unwrap_or(0) as usize),
+            v["days"].as_i64().unwrap_or(0)
+        ),
+        "peers" => {
+            let peers = v["peers"].as_array().cloned().unwrap_or_default();
+            if peers.is_empty() { println!("○ no peers registered"); return; }
+            let scope = v["scope"].as_str().unwrap_or("");
+            let suffix = if scope.is_empty() { String::new() } else { format!("  (scope: {})", scope) };
+            println!("● {} peer{}{}\n", peers.len(), plural(peers.len()), suffix);
+            let w = peers.iter().filter_map(|p| p["id"].as_str()).map(|s| s.chars().count()).max().unwrap_or(0);
+            for p in &peers {
+                let mut line = format!(
+                    "  {:<w$}  seen {}",
+                    p["id"].as_str().unwrap_or("?"),
+                    ago(p["last_seen"].as_i64().unwrap_or(0)),
+                    w = w
+                );
+                if let Some(u) = p["unread"].as_i64() {
+                    if u > 0 { line.push_str(&format!("  ·  {} unread", u)); }
+                }
+                println!("{}", line);
+                if let Some(c) = p["card"].as_str() {
+                    if !c.trim().is_empty() { println!("    {}", ellipsis(c, 96)); }
+                }
+            }
+        }
+        "tasks" => {
+            let tasks = v["tasks"].as_array().cloned().unwrap_or_default();
+            let filter = v["filter"].as_str().unwrap_or("all");
+            if tasks.is_empty() { println!("○ no tasks  (filter: {})", filter); return; }
+            println!("● {} task{}  (filter: {})\n", tasks.len(), plural(tasks.len()), filter);
+            for t in &tasks {
+                println!("  {}  [{}]", t["task_id"].as_str().unwrap_or("?"), t["state"].as_str().unwrap_or("?"));
+                println!(
+                    "    {} → {}  ·  {}",
+                    t["from"].as_str().unwrap_or("?"),
+                    t["to"].as_str().unwrap_or("?"),
+                    ago(t["at"].as_i64().unwrap_or(0))
+                );
+                let b = t["body"].as_str().unwrap_or("");
+                if !b.trim().is_empty() { println!("    {}", ellipsis(b, 96)); }
+                println!();
+            }
+        }
+        _ => println!("{}", serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())),
+    }
+}
+
 fn tools_list() -> Value {
     json!([
         {
@@ -532,7 +728,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "send",
-            "description": "Send a message. to: alias (same team), 'team/alias' (cross-team), 'team:NAME' (broadcast), 'all' (my team), '*' (global). type='task' for work requests with lifecycle tracking.",
+            "description": "Send a message. to: alias (same team), 'team/alias' (cross-team), 'team:NAME' (broadcast), 'all' (my team), '*' (global). type='task' for work requests with lifecycle tracking. If the recipient is not a registered peer the reply carries recipient_registered=false plus known_peers — re-check peers before assuming an agent is absent, since agents join dynamically.",
             "inputSchema": {"type":"object","required":["to","body"],"properties":{
                 "to":      {"type":"string"},
                 "body":    {"type":"string"},
@@ -669,11 +865,11 @@ fn cli_send(flags: &HashMap<String, String>) {
     for (k, j) in [("to","to"),("body","body"),("type","type"),("state","state"),("task-id","task_id")] {
         if let Some(v) = flags.get(k) { args[j] = json!(v); }
     }
-    println!("{}", call_tool(&conn, &cli_team(flags), &cli_alias(flags), "send", &args));
+    emit("send", &call_tool(&conn, &cli_team(flags), &cli_alias(flags), "send", &args), flags);
 }
 fn cli_poll(flags: &HashMap<String, String>) {
     let conn = open_db();
-    println!("{}", call_tool(&conn, &cli_team(flags), &cli_alias(flags), "poll", &json!({})));
+    emit("poll", &call_tool(&conn, &cli_team(flags), &cli_alias(flags), "poll", &json!({})), flags);
 }
 fn cli_peek(flags: &HashMap<String, String>) {
     let conn = open_db();
@@ -685,31 +881,124 @@ fn cli_peek(flags: &HashMap<String, String>) {
     if let Some(v) = flags.get("since-id") {
         if let Ok(n) = v.parse::<i64>() { args["since_id"] = json!(n); }
     }
-    println!("{}", call_tool(&conn, &cli_team(flags), &cli_alias(flags), "peek", &args));
+    emit("peek", &call_tool(&conn, &cli_team(flags), &cli_alias(flags), "peek", &args), flags);
 }
 fn cli_tasks(flags: &HashMap<String, String>) {
     let conn = open_db();
     let mut args = json!({});
     if let Some(v) = flags.get("filter") { args["filter"] = json!(v); }
-    println!("{}", call_tool(&conn, &cli_team(flags), &cli_alias(flags), "tasks", &args));
+    emit("tasks", &call_tool(&conn, &cli_team(flags), &cli_alias(flags), "tasks", &args), flags);
 }
 fn cli_peers(flags: &HashMap<String, String>) {
     let conn = open_db();
     let mut args = json!({});
     if let Some(t) = flags.get("team")  { args["team"]   = json!(t); }
     if flags.get("unread").is_some()     { args["unread"] = json!(true); }
-    println!("{}", call_tool(&conn, &cli_team(flags), "cli", "peers", &args));
+    emit("peers", &call_tool(&conn, &cli_team(flags), "cli", "peers", &args), flags);
 }
 fn cli_register(flags: &HashMap<String, String>) {
     let conn = open_db();
     let mut args = json!({});
     if let Some(v) = flags.get("card") { args["card"] = json!(v); }
-    println!("{}", call_tool(&conn, &cli_team(flags), &cli_alias(flags), "register", &args));
+    emit("register", &call_tool(&conn, &cli_team(flags), &cli_alias(flags), "register", &args), flags);
 }
-fn cli_teams() {
-    let conn = open_db();
-    let teams: Vec<Value> = list_teams(&conn).iter().map(|(t, n)| json!({"team":t,"agents":n})).collect();
-    println!("{}", json!({"ok":true,"teams":teams}));
+
+fn print_teams(conn: &Connection, teams: &[(String, i64)]) {
+    if teams.is_empty() { println!("○ no teams yet — create one below"); return; }
+    println!("● {} team{}\n", teams.len(), plural(teams.len()));
+    let w = teams.iter().map(|(t, _)| t.chars().count()).max().unwrap_or(0);
+    for (t, n) in teams {
+        let members = if *n == 0 { "(empty)".to_string() } else { ellipsis(&list_aliases(conn, t).join(", "), 72) };
+        println!("  {:<w$}  {:>2} agent{}   {}", t, n, if *n == 1 { " " } else { "s" }, members, w = w);
+    }
+    println!();
+}
+
+fn valid_name(s: &str) -> bool { !s.is_empty() && !s.contains(char::is_whitespace) && !s.contains('/') }
+
+fn create_team_interactive(conn: &Connection, existing: &[(String, i64)]) {
+    let cwd_base = std::env::current_dir()
+        .map(|p| basename(&p.to_string_lossy()))
+        .unwrap_or_else(|_| "agent".into());
+    let (guess_team, guess_alias) = guess_identity(&cwd_base);
+
+    // prefill from the cwd, unless that team already exists
+    let team_default = if existing.iter().any(|(t, _)| t == &guess_team) { String::new() } else { guess_team };
+
+    let name = loop {
+        let n = ask_text("New team name", &team_default, Some("lowercase, no spaces (e.g. astrub)")).trim().to_string();
+        if !valid_name(&n)                       { eprintln!("  team name must be non-empty, no spaces or '/'"); continue; }
+        if existing.iter().any(|(t, _)| t == &n) { eprintln!("  team '{}' already exists", n); continue; }
+        break n;
+    };
+
+    // an empty team is legal — it just has no agents yet
+    let add_now = "add its first agent now".to_string();
+    let empty    = "create it empty".to_string();
+    let with_agent = ask_select(
+        "Add an agent?",
+        &[add_now.clone(), empty],
+        &add_now,
+        Some("a team can stay empty and have agents join later"),
+    ) == add_now;
+
+    if !with_agent {
+        println!("\n  team:  {}  (empty)\n", name);
+        if ask_select("Create?", &["Yes".into(), "No — cancel".into()], "Yes", None).starts_with("No") {
+            println!("canceled — nothing written.");
+            return;
+        }
+        match ensure_team(conn, &name) {
+            Ok(())  => println!("● created empty team '{}' — agents can join with --team {}", name, name),
+            Err(e)  => { eprintln!("✗ failed to create team: {}", e); std::process::exit(1); }
+        }
+        return;
+    }
+
+    // "astrub-classic" under team "astrub" -> alias "classic"; else fall back to the folder name
+    let alias_default = if guess_identity(&cwd_base).0 == name { guess_alias } else { cwd_base.clone() };
+
+    let alias = loop {
+        let a = ask_text("First agent alias", &alias_default, Some("this agent's name inside the team")).trim().to_string();
+        if !valid_name(&a) { eprintln!("  alias must be non-empty, no spaces or '/'"); continue; }
+        break a;
+    };
+
+    let card = ask_text("Capability card (optional)", "", Some("shown in the peers roster"));
+    let mut args = json!({});
+    if !card.trim().is_empty() { args["card"] = json!(card.trim()); }
+
+    println!("\n  team:   {}\n  agent:  {}/{}\n", name, name, alias);
+    if ask_select("Create?", &["Yes".into(), "No — cancel".into()], "Yes", None).starts_with("No") {
+        println!("canceled — nothing written.");
+        return;
+    }
+
+    match tool_register(conn, &name, &alias, &args) {
+        Ok(v)  => println!("● created team '{}' with agent {}", name, v["id"].as_str().unwrap_or("?")),
+        Err(e) => { eprintln!("✗ failed to create team: {}", e); std::process::exit(1); }
+    }
+}
+
+fn cli_teams(flags: &HashMap<String, String>) {
+    let conn  = open_db();
+    let teams = list_teams(&conn);
+
+    if flags.contains_key("json") {
+        let t: Vec<Value> = teams.iter().map(|(t, n)| json!({"team":t,"agents":n})).collect();
+        println!("{}", json!({"ok":true,"teams":t}));
+        return;
+    }
+
+    print_teams(&conn, &teams);
+
+    // interactive menu only on a real terminal; piped/scripted use stays a plain listing
+    if !is_tty() || flags.contains_key("no-interactive") { return; }
+
+    let create = "+ create a new team".to_string();
+    if ask_select("What next?", &[create.clone(), "exit".into()], "exit", None) == create {
+        create_team_interactive(&conn, &teams);
+    }
 }
 fn cli_prune(flags: &HashMap<String, String>) {
     let conn = open_db();
@@ -717,14 +1006,14 @@ fn cli_prune(flags: &HashMap<String, String>) {
     if let Some(v) = flags.get("days") {
         if let Ok(n) = v.parse::<i64>() { args["days"] = json!(n); }
     }
-    println!("{}", call_tool(&conn, &cli_team(flags), &cli_alias(flags), "prune", &args));
+    emit("prune", &call_tool(&conn, &cli_team(flags), &cli_alias(flags), "prune", &args), flags);
 }
 fn cli_unregister(flags: &HashMap<String, String>) {
     let conn = open_db();
     let mut args = json!({});
     if let Some(t) = flags.get("team")  { args["team"]  = json!(t); }
     if let Some(a) = flags.get("as").or_else(|| flags.get("alias")) { args["alias"] = json!(a); }
-    println!("{}", call_tool(&conn, &cli_team(flags), &cli_alias(flags), "unregister", &args));
+    emit("unregister", &call_tool(&conn, &cli_team(flags), &cli_alias(flags), "unregister", &args), flags);
 }
 fn cli_whoami(flags: &HashMap<String, String>) {
     let team  = cli_team(flags);
@@ -733,16 +1022,23 @@ fn cli_whoami(flags: &HashMap<String, String>) {
     let alias_src = if std::env::var("AGENT_BUS_ALIAS").is_ok() { "env" }
                     else if flags.contains_key("as") || flags.contains_key("alias") { "flag" }
                     else { "default" };
-    println!("{}", json!({
+    let v = json!({
         "ok":       true,
         "identity": format!("{}/{}", team, alias),
         "team":     {"value": team,  "source": team_src},
         "alias":    {"value": alias, "source": alias_src},
         "db":       db_path().display().to_string(),
         "bus_home": bus_home().display().to_string(),
-    }));
+    });
+    if flags.contains_key("json") { println!("{}", v); return; }
+
+    println!("● {}/{}\n", team, alias);
+    println!("  team      {}  ({})", team, team_src);
+    println!("  alias     {}  ({})", alias, alias_src);
+    println!("  db        {}", db_path().display());
+    println!("  bus home  {}", bus_home().display());
 }
-fn cli_doctor(_flags: &HashMap<String, String>) {
+fn cli_doctor(flags: &HashMap<String, String>) {
     let mut checks: Vec<Value> = vec![];
     let mut all_ok = true;
 
@@ -811,19 +1107,55 @@ fn cli_doctor(_flags: &HashMap<String, String>) {
         }
 
         drop(stmt);
-        let open: i64 = conn
-            .query_row(
-                "SELECT COUNT(DISTINCT task_id) FROM messages fm \
-                 INNER JOIN (SELECT task_id, MAX(id) last_id FROM messages GROUP BY task_id) agg ON fm.id=agg.last_id \
-                 WHERE fm.state NOT IN ('completed','failed','info')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        checks.push(json!({"check":"open_tasks","status":"ok","count":open}));
+        // fm.task_id must be qualified — bare `task_id` is ambiguous against agg and
+        // the resulting SQL error used to be swallowed, always reporting 0 open
+        let open: rusqlite::Result<i64> = conn.query_row(
+            "SELECT COUNT(DISTINCT fm.task_id) FROM messages fm \
+             INNER JOIN (SELECT task_id, MAX(id) last_id FROM messages GROUP BY task_id) agg ON fm.id=agg.last_id \
+             WHERE fm.state NOT IN ('completed','failed','info')",
+            [],
+            |r| r.get(0),
+        );
+        match open {
+            Ok(n)  => checks.push(json!({"check":"open_tasks","status":"ok","count":n})),
+            Err(e) => {
+                checks.push(json!({"check":"open_tasks","status":"fail","note":e.to_string()}));
+                all_ok = false;
+            }
+        }
     }
 
-    println!("{}", json!({"ok": all_ok, "checks": checks}));
+    let v = json!({"ok": all_ok, "checks": checks});
+    if flags.contains_key("json") { println!("{}", v); return; }
+
+    let warns = checks.iter().filter(|c| c["status"] == "warn").count();
+    let headline = if !all_ok        { "issues found".to_string() }
+                   else if warns > 0 { format!("{} warning{}", warns, plural(warns)) }
+                   else              { "all checks passed".to_string() };
+    println!("● doctor — {}\n", headline);
+    let w = checks.iter().filter_map(|c| c["check"].as_str()).map(|s| s.chars().count()).max().unwrap_or(0);
+    for c in &checks {
+        let sym = match c["status"].as_str().unwrap_or("") {
+            "ok"   => "✓",
+            "warn" => "!",
+            _      => "✗",
+        };
+        // surface whichever detail this check carries
+        let detail = c["note"].as_str().map(String::from)
+            .filter(|s| !s.is_empty())
+            .or_else(|| c["path"].as_str().map(String::from))
+            .or_else(|| c["count"].as_i64().map(|n| format!("{} open", n)))
+            .unwrap_or_default();
+        let stale = c["stale_1h"].as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+
+        let mut line = format!("  {} {:<w$}", sym, c["check"].as_str().unwrap_or("?"), w = w);
+        if !detail.is_empty() { line.push_str(&format!("  {}", detail)); }
+        if !stale.is_empty()  { line.push_str(&format!(": {}", stale)); }
+        println!("{}", line.trim_end());
+    }
+    if !all_ok { std::process::exit(1); }
 }
 
 // ---------------------------------------------------------------- installer / wizard
@@ -852,12 +1184,28 @@ fn choose(label: &str, options: &[&str], default: &str) -> String {
 fn is_tty() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
+// ctrl-c / esc must leave the wizard, not silently accept the default
+fn abort_prompt(err: &InquireError) -> ! {
+    match err {
+        InquireError::OperationInterrupted => eprintln!("\naborted (ctrl-c) — nothing written."),
+        _                                  => eprintln!("\ncanceled — nothing written."),
+    }
+    std::process::exit(130);
+}
+fn is_abort(e: &InquireError) -> bool {
+    matches!(e, InquireError::OperationInterrupted | InquireError::OperationCanceled)
+}
+
 fn ask_select(label: &str, options: &[String], default: &str, help: Option<&str>) -> String {
     if is_tty() {
         let start = options.iter().position(|o| o == default).unwrap_or(0);
         let mut s = Select::new(label, options.to_vec()).with_starting_cursor(start);
         if let Some(h) = help { s = s.with_help_message(h); }
-        s.prompt().unwrap_or_else(|_| default.to_string())
+        match s.prompt() {
+            Ok(v)                    => v,
+            Err(e) if is_abort(&e)   => abort_prompt(&e),
+            Err(_)                   => default.to_string(),
+        }
     } else {
         let refs: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
         choose(label, &refs, default)
@@ -869,7 +1217,9 @@ fn ask_text(label: &str, default: &str, help: Option<&str>) -> String {
         if let Some(h) = help { t = t.with_help_message(h); }
         match t.prompt() {
             Ok(s) if !s.trim().is_empty() => s,
-            _ => default.to_string(),
+            Ok(_)                         => default.to_string(),
+            Err(e) if is_abort(&e)        => abort_prompt(&e),
+            Err(_)                        => default.to_string(),
         }
     } else {
         prompt(label, default)
@@ -986,19 +1336,99 @@ fn install(flags: &HashMap<String, String>) {
     apply_install(&tool, &team, &alias, &repo, card);
 }
 
+// .git is a directory in a normal clone, but a file in a worktree or submodule
+fn find_git_root(start: &Path) -> Option<PathBuf> {
+    let mut p = start.canonicalize().ok()?;
+    loop {
+        if p.join(".git").exists() { return Some(p); }
+        if !p.pop() { return None; }
+    }
+}
+
+// config may live in any directory inside a worktree, not just the repo root —
+// nothing install writes depends on .git being a sibling
+fn validate_install_target(repo: &str) {
+    let canon = PathBuf::from(repo).canonicalize().unwrap_or_else(|_| {
+        eprintln!("error: {} does not exist", repo);
+        std::process::exit(1);
+    });
+
+    if let Ok(home) = std::env::var("HOME") {
+        if let Ok(home_canon) = PathBuf::from(home).canonicalize() {
+            if canon == home_canon {
+                eprintln!("error: refusing to write config files into your home directory");
+                eprintln!("       target a specific project repo instead");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    match find_git_root(&canon) {
+        None => {
+            eprintln!("error: {} is not inside a git repository", canon.display());
+            eprintln!("       (.git not found here or in any parent directory)");
+            std::process::exit(1);
+        }
+        Some(root) if root != canon => {
+            println!("note: installing into a subdirectory of the repo at {}", root.display());
+            println!("      launch Claude Code from {} for this identity to apply", canon.display());
+        }
+        Some(_) => {}
+    }
+}
+
+const EXCLUDE_MARK: &str = "# agent-bus (local-only, not committed)";
+
+// resolves through worktrees/submodules, where .git is a file rather than a directory
+fn git_exclude_path(root: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C").arg(root)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .output()
+        .ok()?;
+    if !out.status.success() { return None; }
+    let raw = String::from_utf8(out.stdout).ok()?;
+    let p = PathBuf::from(raw.trim());
+    Some(if p.is_absolute() { p } else { root.join(p) })
+}
+
+// keep agent config out of the enclosing repo without touching the tracked .gitignore
+fn add_git_excludes(target: &Path) {
+    let Some(root) = find_git_root(target) else { return };
+    let Some(excl) = git_exclude_path(&root) else { return };
+
+    // patterns are anchored to the repo root, so a subfolder install needs its prefix
+    let prefix = target.strip_prefix(&root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let pfx = if prefix.is_empty() { String::new() } else { format!("{}/", prefix) };
+    let entries = [
+        format!("/{}.mcp.json", pfx),
+        format!("/{}CLAUDE.md", pfx),
+        format!("/{}.claude/", pfx),
+    ];
+
+    let existing = fs::read_to_string(&excl).unwrap_or_default();
+    let missing: Vec<&String> = entries
+        .iter()
+        .filter(|e| !existing.lines().any(|l| l.trim() == e.as_str()))
+        .collect();
+    if missing.is_empty() { return; }
+
+    if let Some(parent) = excl.parent() { let _ = fs::create_dir_all(parent); }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') { out.push('\n'); }
+    if !out.contains(EXCLUDE_MARK) { out.push_str(&format!("\n{}\n", EXCLUDE_MARK)); }
+    for e in &missing { out.push_str(e); out.push('\n'); }
+
+    match fs::write(&excl, out) {
+        Ok(())  => println!("excluded agent config via {}", excl.display()),
+        Err(e)  => eprintln!("warning: could not write {}: {}", excl.display(), e),
+    }
+}
+
 fn apply_install(tool: &str, team: &str, alias: &str, repo: &str, card: Option<&str>) {
-    let repo_path = PathBuf::from(repo);
-    if !repo_path.join(".git").exists() {
-        eprintln!("error: {} is not a git repository (.git not found)", repo_path.display());
-        eprintln!("       run 'agent-bus install' from inside the target repo, or pass --repo <path>");
-        std::process::exit(1);
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    if repo_path.to_string_lossy() == home || repo_path == PathBuf::from(&home) {
-        eprintln!("error: refusing to write config files into your home directory");
-        eprintln!("       target a specific project repo instead");
-        std::process::exit(1);
-    }
+    validate_install_target(repo);
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "agent-bus".into());
@@ -1093,6 +1523,9 @@ fn install_claude(repo: &str, team: &str, alias: &str, exe: &str) {
 
     enable_mcp_setting(repo);
     wire_session_hook(repo, team, alias);
+    if std::env::var("AGENT_BUS_NO_GIT_EXCLUDE").is_err() {
+        if let Ok(canon) = PathBuf::from(repo).canonicalize() { add_git_excludes(&canon); }
+    }
     println!("restart the Claude Code session in {} (no approval prompt — auto-enabled)", repo);
 }
 
@@ -1162,6 +1595,12 @@ Monitor(persistent:true, timeout_ms:3600000, command: |\n\
 5. Reply with `mcp__agent-bus__send` — to=\"alias\" (same team), \"team/alias\" (cross-team), or \"team:{team}\" (broadcast).\n\
 6. `mcp__agent-bus__peers` lists your team roster (team:\"*\" = everyone).\n\
 7. `mcp__agent-bus__peek` for read-only history; `mcp__agent-bus__tasks` for task rollup.\n\
+8. Agents join at any time, so your roster is always stale. Before concluding a peer\n\
+   does not exist, re-call `peers` with team:\"*\" — never answer from an earlier roster.\n\
+   If the user names a peer you have not seen, re-check first, then send anyway: mail to a\n\
+   not-yet-registered identity is delivered once that agent registers under it. A `send`\n\
+   reply carrying `recipient_registered: false` means the alias may be a typo — compare it\n\
+   against `known_peers` in the same reply before retrying.\n\
 <!-- /agent-bus-bootstrap -->",
         team = team, alias = alias, flag = fp.display()
     )
@@ -1187,6 +1626,11 @@ fn parse_flags(args: &[String]) -> HashMap<String, String> {
 }
 
 fn main() {
+    // rust ignores SIGPIPE, so `agent-bus peek | head` would panic on EPIPE mid-print.
+    // restore the default handler so we exit quietly like any other unix tool.
+    #[cfg(unix)]
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
+
     let argv: Vec<String> = std::env::args().collect();
     let cmd   = argv.get(1).map(|s| s.as_str()).unwrap_or("");
     let flags = parse_flags(&argv[2.min(argv.len())..]);
@@ -1200,7 +1644,7 @@ fn main() {
         "prune"               => cli_prune(&flags),
         "peers"               => cli_peers(&flags),
         "roster"              => cli_peers(&flags),  // alias: peers scoped to my team (default)
-        "teams"               => cli_teams(),
+        "teams"               => cli_teams(&flags),
         "register"            => cli_register(&flags),
         "unregister"          => cli_unregister(&flags),
         "whoami"              => cli_whoami(&flags),
@@ -1220,12 +1664,17 @@ fn main() {
              prune [--days N]\n\
              peers [--team t|*] [--unread]\n\
              roster                        alias for peers (my team)\n\
-             teams\n\
+             teams [--no-interactive]      list teams; on a tty, offers to create one\n\
              register [--card ..] [--team t] [--as a]\n\
              unregister [--as a] [--team t]\n\
              whoami\n\
              doctor\n\
-             version"
+             version\n\
+             \n\
+             --json    print the raw JSON object instead of formatted output\n\
+             \n\
+             install adds .mcp.json/CLAUDE.md/.claude to the repo's .git/info/exclude;\n\
+             set AGENT_BUS_NO_GIT_EXCLUDE=1 to skip that"
         ),
     }
 }
@@ -1414,6 +1863,99 @@ mod tests {
         let classic = r["peers"].as_array().unwrap().iter()
             .find(|p| p["alias"] == "classic").unwrap();
         assert_eq!(classic["unread"].as_i64().unwrap(), 0);
+    }
+
+    #[test]
+    fn find_git_root_walks_up_from_subdir() {
+        // installing from a subfolder must resolve to the enclosing worktree
+        let root = find_git_root(Path::new("src")).expect("crate root is a git repo");
+        assert!(root.join(".git").exists());
+        assert!(root.join("Cargo.toml").exists());
+        assert!(find_git_root(Path::new("/")).is_none());
+    }
+
+    #[test]
+    fn send_warns_on_unregistered_recipient() {
+        let c = mem();
+        tool_register(&c, "mycs", "bff", &json!({})).unwrap();
+
+        // typo'd alias: delivered, but flagged so the sender can catch it
+        let r = tool_send(&c, "mycs", "bff", &json!({"to":"claude","body":"hi"})).unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["recipient_registered"], false);
+        assert!(r["known_peers"].as_array().unwrap().iter().any(|p| p == "mycs/bff"));
+
+        // a registered recipient carries no warning
+        let r = tool_send(&c, "mycs", "bff", &json!({"to":"bff","body":"self"})).unwrap();
+        assert!(r["warning"].is_null());
+
+        // broadcasts are never flagged — they have no single recipient
+        let r = tool_send(&c, "mycs", "bff", &json!({"to":"team:mycs","body":"all"})).unwrap();
+        assert!(r["warning"].is_null());
+    }
+
+    #[test]
+    fn late_joining_agent_receives_earlier_mail() {
+        // the dynamic-join case: mail sent before an agent registers is still delivered,
+        // because poll matches on recipient and a new cursor starts at 0
+        let c = mem();
+        tool_register(&c, "mycs", "bff", &json!({})).unwrap();
+        tool_send(&c, "mycs", "bff", &json!({"to":"back","body":"do the changes"})).unwrap();
+
+        // 'back' joins only afterwards
+        tool_register(&c, "mycs", "back", &json!({})).unwrap();
+        let r = tool_poll(&c, "mycs", "back").unwrap();
+        assert_eq!(r["count"], 1);
+        assert_eq!(r["messages"][0]["body"], "do the changes");
+    }
+
+    #[test]
+    fn team_can_exist_without_peers() {
+        let c = mem();
+        // an empty team stands on its own and lists with zero agents
+        ensure_team(&c, "ghost").unwrap();
+        let teams = list_teams(&c);
+        assert_eq!(teams, vec![("ghost".to_string(), 0)]);
+
+        // registering into a brand-new team creates that team implicitly
+        tool_register(&c, "astrub", "classic", &json!({})).unwrap();
+        let teams = list_teams(&c);
+        assert_eq!(teams, vec![("astrub".to_string(), 1), ("ghost".to_string(), 0)]);
+
+        // and the empty team survives a peer joining another team
+        assert!(list_teams(&c).iter().any(|(t, n)| t == "ghost" && *n == 0));
+    }
+
+    #[test]
+    fn abort_classifies_ctrl_c_and_esc() {
+        // ctrl-c / esc must abort the wizard; anything else falls back to the default
+        assert!(is_abort(&InquireError::OperationInterrupted));
+        assert!(is_abort(&InquireError::OperationCanceled));
+        assert!(!is_abort(&InquireError::NotTTY));
+    }
+
+    #[test]
+    fn tasks_open_filter_excludes_info() {
+        // 'info' is a status state, not open work — doctor's open_tasks count
+        // excludes it, so --filter open must too or the two disagree
+        let c = mem();
+        tool_register(&c, "astrub", "sync",    &json!({})).unwrap();
+        tool_register(&c, "astrub", "classic", &json!({})).unwrap();
+
+        tool_send(&c, "astrub", "sync", &json!({
+            "to":"classic","body":"real work","type":"task","state":"submitted"})).unwrap();
+        tool_send(&c, "astrub", "sync", &json!({
+            "to":"classic","body":"fyi","type":"status","state":"info"})).unwrap();
+        tool_send(&c, "astrub", "sync", &json!({
+            "to":"classic","body":"done","type":"task","state":"completed"})).unwrap();
+
+        let all = tool_tasks(&c, "astrub", "sync", &json!({"filter":"all"})).unwrap();
+        assert_eq!(all["count"], 3);
+
+        // only the 'submitted' task is open
+        let open = tool_tasks(&c, "astrub", "sync", &json!({"filter":"open"})).unwrap();
+        assert_eq!(open["count"], 1);
+        assert_eq!(open["tasks"][0]["state"], "submitted");
     }
 
     #[test]
