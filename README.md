@@ -14,7 +14,7 @@ cargo build --release
 ## Commands
 ```
 agent-bus serve                 MCP stdio server (point a CLI's MCP config at this)
-agent-bus install [...]         interactive installer (writes MCP config + CLAUDE.md bootstrap)
+agent-bus install [...]         interactive installer (writes MCP config + CLAUDE.local.md bootstrap)
 agent-bus send --to X --body Y [--type task] [--state s] [--task-id id] [--as alias]
 agent-bus poll [--as alias]
 agent-bus peers
@@ -37,7 +37,7 @@ Identity is `team/alias` — `AGENT_BUS_TEAM`+`AGENT_BUS_ALIAS` (server) or `--t
 Just run the binary — bare `agent-bus` (or `agent-bus setup`) launches an interactive
 wizard that asks tool / team / alias / repo and pre-guesses `team/alias` from the repo
 name (`astrub-classic` → team `astrub`, alias `classic`). It writes the config and, for
-Claude, upserts a self-bootstrap block into that repo's `CLAUDE.md`.
+Claude, upserts a self-bootstrap block into that repo's `CLAUDE.local.md`.
 
 ```bash
 agent-bus                 # interactive first-time setup
@@ -86,14 +86,14 @@ set `"enableAllProjectMcpServers": true` in `~/.claude/settings.json`.
 
 ## Teams / rosters
 A **team** is a logical namespace over one shared bus — same-team is the default scope,
-cross-team is addressable explicitly, and `peers()` is the team roster (derived, never
-cached). One physical `bus.db`, many logical teams. So astrub's many repos group as team
+cross-team is addressable explicitly, and `peers()` is the team roster (queried live, never
+cached). A team may exist with no agents. One physical `bus.db`, many logical teams. So astrub's many repos group as team
 `astrub` (`astrub/sync`, `astrub/classic`, `astrub/client`); a different project is its
 own team on the same bus with no cross-chatter unless explicitly addressed. Mirrors the
 astrub cockpit-group / party philosophy, one layer up (agents instead of game accounts).
 
 ## Wake (doorbell) — Claude Code
-The installer's CLAUDE.md block arms this automatically; manually it's:
+The installer's CLAUDE.local.md block arms this automatically; manually it's:
 ```
 Monitor(persistent:true, timeout_ms:3600000, command: |
   f=~/.agent-bus/inbox/astrub/sync.flag; last=""; while true; do
