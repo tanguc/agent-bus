@@ -124,10 +124,12 @@ fn open_db() -> Connection {
     conn
 }
 
+// touch presence only — never create the peer. inserting here conjured card-less ghost
+// peers from a single poll, which made uninstalled identities look registered and
+// defeated the recipient check in send()
 fn mark_seen(conn: &Connection, team: &str, alias: &str) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO peers(team, alias, last_seen) VALUES(?1, ?2, ?3) \
-         ON CONFLICT(team, alias) DO UPDATE SET last_seen=?3",
+        "UPDATE peers SET last_seen=?3 WHERE team=?1 AND alias=?2",
         params![team, alias, now_ms()],
     )?;
     Ok(())
@@ -1392,6 +1394,17 @@ fn git_exclude_path(root: &Path) -> Option<PathBuf> {
     Some(if p.is_absolute() { p } else { root.join(p) })
 }
 
+fn is_git_tracked(dir: &Path, file: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C").arg(dir)
+        .args(["ls-files", "--error-unmatch", file])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 // keep agent config out of the enclosing repo without touching the tracked .gitignore
 fn add_git_excludes(target: &Path) {
     let Some(root) = find_git_root(target) else { return };
@@ -1402,28 +1415,48 @@ fn add_git_excludes(target: &Path) {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     let pfx = if prefix.is_empty() { String::new() } else { format!("{}/", prefix) };
+    // CLAUDE.md is the user's own file — only our generated artifacts get excluded
     let entries = [
         format!("/{}.mcp.json", pfx),
-        format!("/{}CLAUDE.md", pfx),
+        format!("/{}CLAUDE.local.md", pfx),
         format!("/{}.claude/", pfx),
     ];
 
     let existing = fs::read_to_string(&excl).unwrap_or_default();
+
+    // older versions excluded CLAUDE.md; it is the user's file now, so drop that
+    // line if we are the ones who added it (i.e. it sits below our marker)
+    let legacy = format!("/{}CLAUDE.md", pfx);
+    let mut past_mark = false;
+    let mut pruned_any = false;
+    let pruned: String = existing
+        .lines()
+        .filter(|l| {
+            if l.trim() == EXCLUDE_MARK { past_mark = true; return true; }
+            if past_mark && l.trim() == legacy { pruned_any = true; return false; }
+            true
+        })
+        .map(|l| format!("{}\n", l))
+        .collect();
+
     let missing: Vec<&String> = entries
         .iter()
-        .filter(|e| !existing.lines().any(|l| l.trim() == e.as_str()))
+        .filter(|e| !pruned.lines().any(|l| l.trim() == e.as_str()))
         .collect();
-    if missing.is_empty() { return; }
+    if missing.is_empty() && !pruned_any { return; }
 
     if let Some(parent) = excl.parent() { let _ = fs::create_dir_all(parent); }
-    let mut out = existing;
+    let mut out = pruned;
     if !out.is_empty() && !out.ends_with('\n') { out.push('\n'); }
     if !out.contains(EXCLUDE_MARK) { out.push_str(&format!("\n{}\n", EXCLUDE_MARK)); }
     for e in &missing { out.push_str(e); out.push('\n'); }
 
     match fs::write(&excl, out) {
-        Ok(())  => println!("excluded agent config via {}", excl.display()),
-        Err(e)  => eprintln!("warning: could not write {}: {}", excl.display(), e),
+        Ok(()) => {
+            println!("excluded agent config via {}", excl.display());
+            if pruned_any { println!("      dropped the stale {} exclude — that file is yours", legacy); }
+        }
+        Err(e) => eprintln!("warning: could not write {}: {}", excl.display(), e),
     }
 }
 
@@ -1448,9 +1481,27 @@ fn apply_install(tool: &str, team: &str, alias: &str, repo: &str, card: Option<&
     println!("registered {}/{} on the bus", team, alias);
 }
 
+const BLOCK_START: &str = "<!-- agent-bus-bootstrap -->";
+const BLOCK_END:   &str = "<!-- /agent-bus-bootstrap -->";
+
+fn has_block(s: &str) -> bool { s.contains(BLOCK_START) && s.contains(BLOCK_END) }
+
+// returns the text with our block removed; used to migrate a legacy CLAUDE.md
+fn strip_block(existing: &str) -> String {
+    match (existing.find(BLOCK_START), existing.find(BLOCK_END)) {
+        (Some(s), Some(e)) if e > s => {
+            let mut out = String::new();
+            out.push_str(&existing[..s]);
+            out.push_str(&existing[e + BLOCK_END.len()..]);
+            out
+        }
+        _ => existing.to_string(),
+    }
+}
+
 fn upsert_block(existing: &str, block: &str) -> String {
-    let start = "<!-- agent-bus-bootstrap -->";
-    let end   = "<!-- /agent-bus-bootstrap -->";
+    let start = BLOCK_START;
+    let end   = BLOCK_END;
     if let (Some(s), Some(e)) = (existing.find(start), existing.find(end)) {
         let mut out = String::new();
         out.push_str(&existing[..s]);
@@ -1499,6 +1550,35 @@ fn wire_session_hook(repo: &str, team: &str, alias: &str) {
     println!("wired SessionStart hook in {}", path.display());
 }
 
+// older installs put the block in CLAUDE.md, which for a tracked file leaks
+// machine-specific paths into git history. pull it back out.
+fn migrate_legacy_block(repo: &Path) {
+    let cm = repo.join("CLAUDE.md");
+    let Ok(existing) = fs::read_to_string(&cm) else { return };
+    if !has_block(&existing) { return; }
+
+    let stripped = strip_block(&existing);
+    if stripped.trim().is_empty() {
+        // agent-bus was the file's only content — it created it, so remove it
+        match fs::remove_file(&cm) {
+            Ok(())  => println!("removed {} (contained only the agent-bus block)", cm.display()),
+            Err(e)  => eprintln!("warning: could not remove {}: {}", cm.display(), e),
+        }
+        return;
+    }
+
+    let cleaned = format!("{}\n", stripped.trim_end());
+    match fs::write(&cm, cleaned) {
+        Ok(()) => {
+            println!("migrated the agent-bus block out of {}", cm.display());
+            if is_git_tracked(repo, "CLAUDE.md") {
+                println!("      CLAUDE.md is tracked — check `git diff` and commit the removal");
+            }
+        }
+        Err(e) => eprintln!("warning: could not rewrite {}: {}", cm.display(), e),
+    }
+}
+
 fn install_claude(repo: &str, team: &str, alias: &str, exe: &str) {
     let mcp_path = PathBuf::from(repo).join(".mcp.json");
     let mut root: Value = if mcp_path.exists() {
@@ -1515,11 +1595,15 @@ fn install_claude(repo: &str, team: &str, alias: &str, exe: &str) {
     fs::write(&mcp_path, serde_json::to_string_pretty(&root).unwrap() + "\n").expect("write .mcp.json");
     println!("wrote {}", mcp_path.display());
 
-    let cm = PathBuf::from(repo).join("CLAUDE.md");
-    let existing = fs::read_to_string(&cm).unwrap_or_default();
-    let updated  = upsert_block(&existing, &bootstrap_block(team, alias));
-    fs::write(&cm, updated).expect("write CLAUDE.md");
-    println!("wrote agent-bus bootstrap into {}", cm.display());
+    // the bootstrap hardcodes machine-specific inbox paths, so it belongs in
+    // CLAUDE.local.md — loaded right after CLAUDE.md, and never committed
+    let local = PathBuf::from(repo).join("CLAUDE.local.md");
+    let existing = fs::read_to_string(&local).unwrap_or_default();
+    fs::write(&local, upsert_block(&existing, &bootstrap_block(team, alias)))
+        .expect("write CLAUDE.local.md");
+    println!("wrote agent-bus bootstrap into {}", local.display());
+
+    migrate_legacy_block(Path::new(repo));
 
     enable_mcp_setting(repo);
     wire_session_hook(repo, team, alias);
@@ -1863,6 +1947,46 @@ mod tests {
         let classic = r["peers"].as_array().unwrap().iter()
             .find(|p| p["alias"] == "classic").unwrap();
         assert_eq!(classic["unread"].as_i64().unwrap(), 0);
+    }
+
+    #[test]
+    fn strip_block_removes_only_our_block() {
+        let block = bootstrap_block("astrub", "classic");
+        let user_doc = "# My project\n\nSome real notes.\n";
+
+        // block appended to a real doc -> doc survives, block gone
+        let combined = upsert_block(user_doc, &block);
+        assert!(has_block(&combined));
+        let stripped = strip_block(&combined);
+        assert!(!has_block(&stripped));
+        assert!(stripped.contains("Some real notes."));
+        assert!(stripped.contains("# My project"));
+
+        // a file that is nothing but the block strips to empty -> caller deletes it
+        assert!(strip_block(&block).trim().is_empty());
+
+        // a doc without our block is untouched
+        assert_eq!(strip_block(user_doc), user_doc);
+    }
+
+    #[test]
+    fn poll_and_send_do_not_conjure_ghost_peers() {
+        // a bare poll/send must not create a peer — only register does. otherwise an
+        // uninstalled identity shows up on the roster and send()'s recipient check lies
+        let c = mem();
+        tool_poll(&c, "stonebill", "stonebill").unwrap();
+        tool_send(&c, "stonebill", "stonebill", &json!({"to":"nobody","body":"x"})).unwrap();
+        let peers = tool_peers(&c, "stonebill", &json!({})).unwrap();
+        assert!(peers["peers"].as_array().unwrap().is_empty());
+        assert!(!peer_exists(&c, "stonebill", "stonebill"));
+
+        // register creates it; a later poll just refreshes last_seen
+        tool_register(&c, "stonebill", "stonebill", &json!({"card":"real"})).unwrap();
+        assert!(peer_exists(&c, "stonebill", "stonebill"));
+        tool_poll(&c, "stonebill", "stonebill").unwrap();
+        let peers = tool_peers(&c, "stonebill", &json!({})).unwrap();
+        assert_eq!(peers["peers"].as_array().unwrap().len(), 1);
+        assert_eq!(peers["peers"][0]["card"], "real");
     }
 
     #[test]
