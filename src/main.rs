@@ -437,6 +437,91 @@ fn tool_prune(conn: &Connection, args: &Value) -> rusqlite::Result<Value> {
     Ok(json!({"ok": true, "deleted": n, "days": days}))
 }
 
+// the identity a repo's .mcp.json configures the agent-bus server to run as
+fn mcp_identity(mcp_path: &Path) -> Option<(String, String)> {
+    let v: Value = serde_json::from_str(&fs::read_to_string(mcp_path).ok()?).ok()?;
+    let env = &v["mcpServers"]["agent-bus"]["env"];
+    Some((env["AGENT_BUS_TEAM"].as_str()?.to_string(),
+          env["AGENT_BUS_ALIAS"].as_str()?.to_string()))
+}
+
+// detect (and with fix, reconcile) bus state left dangling by deletions/renames:
+//   - open tasks addressed to a recipient that is no longer a registered peer
+//   - cursors belonging to a peer that no longer exists
+fn tool_sync(conn: &Connection, fix: bool) -> rusqlite::Result<Value> {
+    let mut orphans: Vec<Value> = vec![];
+    {
+        let mut stmt = conn.prepare(
+            "SELECT a.task_id, fm.recipient_team, fm.recipient_alias, \
+                    fm.sender_team, fm.sender_alias, lm.state \
+             FROM messages fm \
+             JOIN (SELECT task_id, MIN(id) fid, MAX(id) lid FROM messages GROUP BY task_id) a ON fm.id=a.fid \
+             JOIN messages lm ON lm.id=a.lid \
+             WHERE lm.state IN ('submitted','working','accepted') AND fm.recipient_alias<>'*'",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((
+            r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?,
+        )))?;
+        for (task_id, rt, ra, st, sa, state) in rows.flatten() {
+            if !peer_exists(conn, &rt, &ra) {
+                orphans.push(json!({
+                    "task_id": task_id, "to": format!("{}/{}", rt, ra),
+                    "from": format!("{}/{}", st, sa), "state": state,
+                    "_st": st, "_sa": sa,
+                }));
+            }
+        }
+    }
+
+    let mut dead: Vec<Value> = vec![];
+    {
+        let mut stmt = conn.prepare("SELECT team, alias FROM cursors")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for (t, a) in rows.flatten() {
+            if !peer_exists(conn, &t, &a) {
+                dead.push(json!({"team": t, "alias": a}));
+            }
+        }
+    }
+
+    let (mut failed, mut pruned) = (0u64, 0u64);
+    if fix {
+        for o in &orphans {
+            // append a terminal 'failed' back to the sender so they stop waiting
+            conn.execute(
+                "INSERT INTO messages(task_id, sender_team, sender_alias, recipient_team, recipient_alias, type, state, body, created_at) \
+                 VALUES(?1,'bus','sync',?2,?3,'task','failed',?4,?5)",
+                params![
+                    o["task_id"].as_str().unwrap_or(""),
+                    o["_st"].as_str().unwrap_or(""), o["_sa"].as_str().unwrap_or(""),
+                    format!("auto-failed by sync: recipient {} is no longer registered", o["to"].as_str().unwrap_or("?")),
+                    now_ms()
+                ],
+            )?;
+            touch_doorbell(conn, o["_st"].as_str().unwrap_or(""), o["_sa"].as_str().unwrap_or(""), "bus", "sync");
+            failed += 1;
+        }
+        for d in &dead {
+            pruned += conn.execute(
+                "DELETE FROM cursors WHERE team=?1 AND alias=?2",
+                params![d["team"].as_str().unwrap_or(""), d["alias"].as_str().unwrap_or("")],
+            )? as u64;
+        }
+    }
+
+    // strip internal fields from the reported orphans
+    let orphans_out: Vec<Value> = orphans.iter().map(|o| json!({
+        "task_id": o["task_id"], "to": o["to"], "from": o["from"], "state": o["state"]
+    })).collect();
+
+    Ok(json!({
+        "ok": true, "fixed": fix,
+        "orphaned_tasks": orphans_out, "dead_cursors": dead,
+        "failed_tasks": failed, "pruned_cursors": pruned,
+    }))
+}
+
 fn tool_unregister(conn: &Connection, team: &str, alias: &str, args: &Value) -> rusqlite::Result<Value> {
     let target_team  = args["team"].as_str().unwrap_or(team);
     let target_alias = args["alias"].as_str()
@@ -630,6 +715,7 @@ fn call_tool(conn: &Connection, team: &str, alias: &str, name: &str, args: &Valu
         "peers"             => tool_peers(conn, team, args),
         "prune"             => tool_prune(conn, args),
         "unregister"        => tool_unregister(conn, team, alias, args),
+        "sync"              => tool_sync(conn, args["fix"].as_bool().unwrap_or(false)),
         "create-team"       => tool_create_team(conn, args["name"].as_str().unwrap_or("")),
         "delete-team"       => tool_delete_team(conn, args["name"].as_str().unwrap_or(""), args["force"].as_bool().unwrap_or(false)),
         "rename-team"       => tool_rename_team(conn, args["from"].as_str().unwrap_or(""), args["to"].as_str().unwrap_or("")),
@@ -728,6 +814,32 @@ fn emit(cmd: &str, v: &Value, flags: &HashMap<String, String>) {
                     let ids: Vec<&str> = k.iter().filter_map(|x| x.as_str()).collect();
                     if !ids.is_empty() { println!("  registered peers: {}", ids.join(", ")); }
                 }
+            }
+        }
+        "sync" => {
+            let ot = v["orphaned_tasks"].as_array().cloned().unwrap_or_default();
+            let dc = v["dead_cursors"].as_array().cloned().unwrap_or_default();
+            let fixed = v["fixed"].as_bool().unwrap_or(false);
+            if ot.is_empty() && dc.is_empty() { println!("● bus in sync — no orphans"); return; }
+            let mark = if fixed { "●" } else { "!" };
+            if !ot.is_empty() {
+                println!("{} {} orphaned open task{} (recipient no longer registered):", mark, ot.len(), plural(ot.len()));
+                for t in &ot {
+                    println!("  {}  {} → {}  [{}]",
+                        t["task_id"].as_str().unwrap_or("?"), t["from"].as_str().unwrap_or("?"),
+                        t["to"].as_str().unwrap_or("?"), t["state"].as_str().unwrap_or("?"));
+                }
+            }
+            if !dc.is_empty() {
+                println!("{} {} dead cursor{} (peer gone):", mark, dc.len(), plural(dc.len()));
+                for d in &dc { println!("  {}/{}", d["team"].as_str().unwrap_or("?"), d["alias"].as_str().unwrap_or("?")); }
+            }
+            if fixed {
+                println!("\n● reconciled: {} task{} failed, {} cursor{} pruned",
+                    v["failed_tasks"].as_i64().unwrap_or(0), plural(v["failed_tasks"].as_i64().unwrap_or(0) as usize),
+                    v["pruned_cursors"].as_i64().unwrap_or(0), plural(v["pruned_cursors"].as_i64().unwrap_or(0) as usize));
+            } else {
+                println!("\n  run `agent-bus sync --fix` to fail these tasks and prune the cursors");
             }
         }
         "create-team" => println!("● created team '{}'", v["team"].as_str().unwrap_or("?")),
@@ -1094,6 +1206,12 @@ fn need_pos(cmd: &str, pos: &[String], usage: &str) -> String {
     }
 }
 
+fn cli_sync(flags: &HashMap<String, String>) {
+    let conn = open_db();
+    let args = json!({"fix": flags.contains_key("fix")});
+    emit("sync", &call_tool(&conn, "cli", "cli", "sync", &args), flags);
+}
+
 fn cli_create_team(flags: &HashMap<String, String>, pos: &[String]) {
     let name = need_pos("create-team", pos, "a team name");
     let conn = open_db();
@@ -1237,6 +1355,23 @@ fn cli_doctor(flags: &HashMap<String, String>) {
             Err(e) => {
                 checks.push(json!({"check":"open_tasks","status":"fail","note":e.to_string()}));
                 all_ok = false;
+            }
+        }
+
+        // 6. is this repo's configured identity still in sync with the bus?
+        // env wins (running as the MCP server); else read cwd/.mcp.json
+        let identity = std::env::var("AGENT_BUS_TEAM").ok()
+            .zip(std::env::var("AGENT_BUS_ALIAS").ok())
+            .or_else(|| mcp_identity(&mcp));
+        if let Some((t, a)) = identity {
+            if !team_row_exists(&conn, &t) {
+                checks.push(json!({"check":"identity","status":"warn",
+                    "note":format!("{}/{} — team '{}' is not on the bus; a restart recreates it. finish the migration or update this repo's config", t, a, t)}));
+            } else if !peer_exists(&conn, &t, &a) {
+                checks.push(json!({"check":"identity","status":"warn",
+                    "note":format!("{}/{} — configured but not registered yet (registers on next session start)", t, a)}));
+            } else {
+                checks.push(json!({"check":"identity","status":"ok","note":format!("{}/{}", t, a)}));
             }
         }
     }
@@ -1808,7 +1943,7 @@ Monitor(persistent:true, timeout_ms:3600000, command: |\n\
 // positionals used to be silently discarded, so `unregister foo --team t` dropped
 // `foo` and fell back to the caller's own alias — deleting the wrong peer
 // valueless flags must not swallow the next token, or `--unread foo` eats `foo`
-const BOOL_FLAGS: &[&str] = &["json", "help", "h", "unread", "no-interactive", "force"];
+const BOOL_FLAGS: &[&str] = &["json", "help", "h", "unread", "no-interactive", "force", "fix"];
 
 fn parse_args(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
     let mut m = HashMap::new();
@@ -1868,6 +2003,7 @@ fn spec(cmd: &str) -> (&'static [&'static str], usize) {
         "unregister"           => (&["team", "as", "alias"], 1), // positional: alias or team/alias
         "whoami"               => (&["team", "as"], 0),
         "doctor"               => (&[], 0),
+        "sync"                 => (&["fix"], 0),
         _                      => (&[], 0),
     }
 }
@@ -1892,7 +2028,8 @@ fn usage() -> &'static str {
      register [--card ..] [--team t] [--as a]\n\
      unregister [alias | team/alias]    defaults to self if no target given\n\
      whoami\n\
-     doctor\n\
+     doctor                        per-agent health, incl. identity/bus drift\n\
+     sync [--fix]                  find bus-wide orphans (dead recipients/cursors); --fix reconciles\n\
      version\n\
      \n\
      --help    show this message           --json    print the raw JSON object\n\
@@ -1923,7 +2060,7 @@ fn main() {
         "", "setup", "serve", "install", "send", "poll", "peek", "history", "tasks",
         "prune", "peers", "roster", "teams", "create-team", "delete-team",
         "rename-team", "register", "unregister", "whoami",
-        "doctor", "version", "--version", "-V",
+        "doctor", "sync", "version", "--version", "-V",
     ];
     if !COMMANDS.contains(&cmd) {
         eprintln!("error: unknown command `{}`\n", cmd);
@@ -1954,6 +2091,7 @@ fn main() {
         "unregister"          => cli_unregister(&flags, &pos),
         "whoami"              => cli_whoami(&flags),
         "doctor"              => cli_doctor(&flags),
+        "sync"                => cli_sync(&flags),
         "version" | "--version" | "-V" => println!("{}", version_string()),
         "" | "setup"          => wizard(),
         other => {
@@ -2272,6 +2410,61 @@ mod tests {
         let r = tool_poll(&c, "mycs", "back").unwrap();
         assert_eq!(r["count"], 1);
         assert_eq!(r["messages"][0]["body"], "do the changes");
+    }
+
+    #[test]
+    fn sync_detects_and_fixes_orphans() {
+        let c = mem();
+        tool_register(&c, "astrub", "client", &json!({})).unwrap();
+        tool_register(&c, "astrub", "ghost",  &json!({})).unwrap();
+        tool_register(&c, "home-infra", "infra-repo", &json!({})).unwrap();
+        // an open task from client to infra-repo, and infra-repo drains once so it has a cursor
+        tool_send(&c, "astrub", "client", &json!({"to":"home-infra/infra-repo","body":"need IP","type":"task"})).unwrap();
+        tool_poll(&c, "home-infra", "infra-repo").unwrap();
+        // ghost must actually receive something for a cursor row to be written
+        tool_send(&c, "astrub", "client", &json!({"to":"ghost","body":"hi"})).unwrap();
+        tool_poll(&c, "astrub", "ghost").unwrap();
+
+        // clean bus: nothing orphaned yet
+        let r = tool_sync(&c, false).unwrap();
+        assert_eq!(r["orphaned_tasks"].as_array().unwrap().len(), 0);
+        assert_eq!(r["dead_cursors"].as_array().unwrap().len(), 0);
+
+        // unregister leaves ghost's cursor behind (dead cursor);
+        // delete-team removes infra-repo entirely (its recipient task orphans)
+        tool_unregister(&c, "astrub", "ghost", &json!({})).unwrap();
+        tool_delete_team(&c, "home-infra", true).unwrap();
+
+        let r = tool_sync(&c, false).unwrap();
+        assert_eq!(r["orphaned_tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(r["orphaned_tasks"][0]["to"], "home-infra/infra-repo");
+        assert_eq!(r["dead_cursors"].as_array().unwrap().len(), 1);
+        assert_eq!(r["dead_cursors"][0]["alias"], "ghost");
+        // detect-only must not mutate
+        assert_eq!(tool_tasks(&c, "astrub", "client", &json!({"filter":"open"})).unwrap()["count"], 1);
+
+        // --fix: task goes failed (delivered back to the sender), cursor pruned
+        let r = tool_sync(&c, true).unwrap();
+        assert_eq!(r["failed_tasks"], 1);
+        assert_eq!(r["pruned_cursors"], 1);
+        assert_eq!(tool_tasks(&c, "astrub", "client", &json!({"filter":"open"})).unwrap()["count"], 0);
+        let got = tool_poll(&c, "astrub", "client").unwrap();
+        assert!(got["messages"].as_array().unwrap().iter().any(|m| m["state"] == "failed"));
+
+        // idempotent: a second sync finds nothing
+        let r = tool_sync(&c, true).unwrap();
+        assert_eq!(r["orphaned_tasks"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn mcp_identity_parses_team_alias() {
+        let dir = std::env::temp_dir().join(format!("ab-mcp-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(".mcp.json");
+        std::fs::write(&p, r#"{"mcpServers":{"agent-bus":{"env":{"AGENT_BUS_TEAM":"sergen","AGENT_BUS_ALIAS":"infra-home"}}}}"#).unwrap();
+        assert_eq!(mcp_identity(&p), Some(("sergen".into(), "infra-home".into())));
+        assert_eq!(mcp_identity(&dir.join("nope.json")), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
