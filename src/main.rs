@@ -552,6 +552,64 @@ fn ensure_team(conn: &Connection, name: &str) -> rusqlite::Result<()> {
     )?;
     Ok(())
 }
+
+fn team_row_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row("SELECT 1 FROM teams WHERE name=?1", params![name], |_| Ok(()))
+        .optional().map(|o| o.is_some()).unwrap_or(false)
+}
+
+// team CRUD: create/read(=peers,teams)/update(rename)/delete
+fn tool_create_team(conn: &Connection, name: &str) -> rusqlite::Result<Value> {
+    if !valid_name(name) {
+        return Ok(json!({"ok": false, "error": "team name must be non-empty, no spaces or '/'"}));
+    }
+    if team_row_exists(conn, name) {
+        return Ok(json!({"ok": false, "error": format!("team '{}' already exists", name)}));
+    }
+    ensure_team(conn, name)?;
+    Ok(json!({"ok": true, "created": true, "team": name}))
+}
+
+fn tool_delete_team(conn: &Connection, name: &str, force: bool) -> rusqlite::Result<Value> {
+    if !team_row_exists(conn, name) {
+        return Ok(json!({"ok": false, "error": format!("no such team '{}'", name)}));
+    }
+    let members = list_aliases(conn, name);
+    if !members.is_empty() && !force {
+        return Ok(json!({
+            "ok": false, "needs_force": true, "team": name, "agents": members,
+            "error": format!("team '{}' has {} agent(s) — re-run with --force to remove them too", name, members.len())
+        }));
+    }
+    // message history is an append-only log; leave it, but drop live state
+    conn.execute("DELETE FROM peers   WHERE team=?1", params![name])?;
+    conn.execute("DELETE FROM cursors WHERE team=?1", params![name])?;
+    conn.execute("DELETE FROM teams   WHERE name=?1", params![name])?;
+    Ok(json!({"ok": true, "deleted": true, "team": name, "removed_agents": members.len()}))
+}
+
+fn tool_rename_team(conn: &Connection, from: &str, to: &str) -> rusqlite::Result<Value> {
+    if !team_row_exists(conn, from) {
+        return Ok(json!({"ok": false, "error": format!("no such team '{}'", from)}));
+    }
+    if !valid_name(to) {
+        return Ok(json!({"ok": false, "error": "new team name must be non-empty, no spaces or '/'"}));
+    }
+    if team_row_exists(conn, to) {
+        return Ok(json!({"ok": false, "error": format!("team '{}' already exists", to)}));
+    }
+    // cascade the rename across every table that stores a team, atomically. exact
+    // matches only — '*' broadcasts and other teams are untouched
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("UPDATE teams    SET name=?2           WHERE name=?1",           params![from, to])?;
+    let n = tx.execute("UPDATE peers SET team=?2      WHERE team=?1",           params![from, to])?;
+    tx.execute("UPDATE cursors  SET team=?2           WHERE team=?1",           params![from, to])?;
+    tx.execute("UPDATE messages SET sender_team=?2    WHERE sender_team=?1",    params![from, to])?;
+    tx.execute("UPDATE messages SET recipient_team=?2 WHERE recipient_team=?1", params![from, to])?;
+    tx.execute("UPDATE receipts SET reader_team=?2    WHERE reader_team=?1",    params![from, to])?;
+    tx.commit()?;
+    Ok(json!({"ok": true, "renamed": true, "from": from, "to": to, "agents": n}))
+}
 fn list_aliases(conn: &Connection, team: &str) -> Vec<String> {
     let mut stmt = match conn.prepare("SELECT alias FROM peers WHERE team=?1 ORDER BY alias") {
         Ok(s) => s,
@@ -572,6 +630,9 @@ fn call_tool(conn: &Connection, team: &str, alias: &str, name: &str, args: &Valu
         "peers"             => tool_peers(conn, team, args),
         "prune"             => tool_prune(conn, args),
         "unregister"        => tool_unregister(conn, team, alias, args),
+        "create-team"       => tool_create_team(conn, args["name"].as_str().unwrap_or("")),
+        "delete-team"       => tool_delete_team(conn, args["name"].as_str().unwrap_or(""), args["force"].as_bool().unwrap_or(false)),
+        "rename-team"       => tool_rename_team(conn, args["from"].as_str().unwrap_or(""), args["to"].as_str().unwrap_or("")),
         _ => return json!({"ok": false, "error": format!("unknown tool: {}", name)}),
     };
     match r {
@@ -640,6 +701,11 @@ fn emit(cmd: &str, v: &Value, flags: &HashMap<String, String>) {
     if flags.contains_key("json") { println!("{}", v); return; }
     if !v["ok"].as_bool().unwrap_or(true) {
         eprintln!("✗ {}", v["error"].as_str().unwrap_or("unknown error"));
+        // delete-team refusal lists the agents that block it
+        if let Some(a) = v["agents"].as_array() {
+            let ids: Vec<&str> = a.iter().filter_map(|x| x.as_str()).collect();
+            if !ids.is_empty() { eprintln!("  agents: {}", ids.join(", ")); }
+        }
         std::process::exit(1);
     }
     match cmd {
@@ -663,6 +729,17 @@ fn emit(cmd: &str, v: &Value, flags: &HashMap<String, String>) {
                     if !ids.is_empty() { println!("  registered peers: {}", ids.join(", ")); }
                 }
             }
+        }
+        "create-team" => println!("● created team '{}'", v["team"].as_str().unwrap_or("?")),
+        "delete-team" => {
+            let n = v["removed_agents"].as_i64().unwrap_or(0);
+            let tail = if n > 0 { format!(" and {} agent{}", n, plural(n as usize)) } else { String::new() };
+            println!("● deleted team '{}'{}", v["team"].as_str().unwrap_or("?"), tail);
+        }
+        "rename-team" => {
+            let n = v["agents"].as_i64().unwrap_or(0);
+            let tail = if n > 0 { format!("  ({} agent{} moved)", n, plural(n as usize)) } else { String::new() };
+            println!("● renamed team '{}' → '{}'{}", v["from"].as_str().unwrap_or("?"), v["to"].as_str().unwrap_or("?"), tail);
         }
         "register" => println!("● registered {}", v["id"].as_str().unwrap_or("?")),
         "unregister" => {
@@ -1010,6 +1087,36 @@ fn cli_prune(flags: &HashMap<String, String>) {
     }
     emit("prune", &call_tool(&conn, &cli_team(flags), &cli_alias(flags), "prune", &args), flags);
 }
+fn need_pos(cmd: &str, pos: &[String], usage: &str) -> String {
+    match pos.first() {
+        Some(p) => p.clone(),
+        None => { eprintln!("error: `agent-bus {}` needs {}", cmd, usage); std::process::exit(2); }
+    }
+}
+
+fn cli_create_team(flags: &HashMap<String, String>, pos: &[String]) {
+    let name = need_pos("create-team", pos, "a team name");
+    let conn = open_db();
+    emit("create-team", &call_tool(&conn, "cli", "cli", "create-team", &json!({"name": name})), flags);
+}
+
+fn cli_delete_team(flags: &HashMap<String, String>, pos: &[String]) {
+    let name = need_pos("delete-team", pos, "a team name");
+    let conn = open_db();
+    let args = json!({"name": name, "force": flags.contains_key("force")});
+    emit("delete-team", &call_tool(&conn, "cli", "cli", "delete-team", &args), flags);
+}
+
+fn cli_rename_team(flags: &HashMap<String, String>, pos: &[String]) {
+    let from = need_pos("rename-team", pos, "<old> <new>");
+    let to   = match pos.get(1) {
+        Some(t) => t.clone(),
+        None => { eprintln!("error: `agent-bus rename-team` needs <old> <new>"); std::process::exit(2); }
+    };
+    let conn = open_db();
+    emit("rename-team", &call_tool(&conn, "cli", "cli", "rename-team", &json!({"from": from, "to": to})), flags);
+}
+
 fn cli_unregister(flags: &HashMap<String, String>, pos: &[String]) {
     let conn = open_db();
     let mut args = json!({});
@@ -1701,7 +1808,7 @@ Monitor(persistent:true, timeout_ms:3600000, command: |\n\
 // positionals used to be silently discarded, so `unregister foo --team t` dropped
 // `foo` and fell back to the caller's own alias — deleting the wrong peer
 // valueless flags must not swallow the next token, or `--unread foo` eats `foo`
-const BOOL_FLAGS: &[&str] = &["json", "help", "h", "unread", "no-interactive"];
+const BOOL_FLAGS: &[&str] = &["json", "help", "h", "unread", "no-interactive", "force"];
 
 fn parse_args(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
     let mut m = HashMap::new();
@@ -1754,6 +1861,9 @@ fn spec(cmd: &str) -> (&'static [&'static str], usize) {
         "prune"                => (&["days", "team", "as"], 0),
         "peers" | "roster"     => (&["team", "unread"], 0),
         "teams"                => (&["no-interactive"], 0),
+        "create-team"          => (&[], 1),          // positional: name
+        "delete-team"          => (&["force"], 1),   // positional: name
+        "rename-team"          => (&[], 2),          // positionals: old new
         "register"             => (&["card", "team", "as"], 0),
         "unregister"           => (&["team", "as", "alias"], 1), // positional: alias or team/alias
         "whoami"               => (&["team", "as"], 0),
@@ -1776,6 +1886,9 @@ fn usage() -> &'static str {
      peers [--team t|*] [--unread]\n\
      roster                        alias for peers (my team)\n\
      teams [--no-interactive]      list teams; on a tty, offers to create one\n\
+     create-team <name>            create an empty team\n\
+     rename-team <old> <new>       rename a team (cascades across the bus)\n\
+     delete-team <name> [--force]  delete a team; --force also removes its agents\n\
      register [--card ..] [--team t] [--as a]\n\
      unregister [alias | team/alias]    defaults to self if no target given\n\
      whoami\n\
@@ -1808,7 +1921,8 @@ fn main() {
     // reject an unknown command before validating its flags, or the error misleads
     const COMMANDS: &[&str] = &[
         "", "setup", "serve", "install", "send", "poll", "peek", "history", "tasks",
-        "prune", "peers", "roster", "teams", "register", "unregister", "whoami",
+        "prune", "peers", "roster", "teams", "create-team", "delete-team",
+        "rename-team", "register", "unregister", "whoami",
         "doctor", "version", "--version", "-V",
     ];
     if !COMMANDS.contains(&cmd) {
@@ -1833,6 +1947,9 @@ fn main() {
         "peers"               => cli_peers(&flags),
         "roster"              => cli_peers(&flags),  // alias: peers scoped to my team (default)
         "teams"               => cli_teams(&flags),
+        "create-team"         => cli_create_team(&flags, &pos),
+        "delete-team"         => cli_delete_team(&flags, &pos),
+        "rename-team"         => cli_rename_team(&flags, &pos),
         "register"            => cli_register(&flags),
         "unregister"          => cli_unregister(&flags, &pos),
         "whoami"              => cli_whoami(&flags),
@@ -2155,6 +2272,70 @@ mod tests {
         let r = tool_poll(&c, "mycs", "back").unwrap();
         assert_eq!(r["count"], 1);
         assert_eq!(r["messages"][0]["body"], "do the changes");
+    }
+
+    #[test]
+    fn team_crud_lifecycle() {
+        let c = mem();
+
+        // create
+        assert_eq!(tool_create_team(&c, "alpha").unwrap()["created"], true);
+        assert!(team_row_exists(&c, "alpha"));
+        // duplicate create refused
+        assert_eq!(tool_create_team(&c, "alpha").unwrap()["ok"], false);
+        // invalid name refused
+        assert_eq!(tool_create_team(&c, "bad name").unwrap()["ok"], false);
+
+        // rename (empty team)
+        assert_eq!(tool_rename_team(&c, "alpha", "beta").unwrap()["renamed"], true);
+        assert!(!team_row_exists(&c, "alpha") && team_row_exists(&c, "beta"));
+
+        // delete empty team
+        assert_eq!(tool_delete_team(&c, "beta", false).unwrap()["deleted"], true);
+        assert!(!team_row_exists(&c, "beta"));
+        // delete missing team refused
+        assert_eq!(tool_delete_team(&c, "beta", false).unwrap()["ok"], false);
+    }
+
+    #[test]
+    fn delete_team_guards_populated_teams() {
+        let c = mem();
+        tool_register(&c, "astrub", "classic", &json!({})).unwrap();
+        tool_register(&c, "astrub", "sync",    &json!({})).unwrap();
+
+        // refused without --force, and the team survives
+        let r = tool_delete_team(&c, "astrub", false).unwrap();
+        assert_eq!(r["ok"], false);
+        assert_eq!(r["needs_force"], true);
+        assert_eq!(r["agents"].as_array().unwrap().len(), 2);
+        assert!(team_row_exists(&c, "astrub"));
+
+        // --force removes team and its agents
+        let r = tool_delete_team(&c, "astrub", true).unwrap();
+        assert_eq!(r["removed_agents"], 2);
+        assert!(!team_row_exists(&c, "astrub"));
+        assert!(!peer_exists(&c, "astrub", "classic"));
+    }
+
+    #[test]
+    fn rename_team_cascades_to_messages_and_peers() {
+        let c = mem();
+        tool_register(&c, "old", "a", &json!({})).unwrap();
+        tool_register(&c, "old", "b", &json!({})).unwrap();
+        tool_send(&c, "old", "a", &json!({"to":"b","body":"hi"})).unwrap();
+
+        let r = tool_rename_team(&c, "old", "new").unwrap();
+        assert_eq!(r["agents"], 2);
+
+        // peer moved, and its mail is still deliverable under the new team
+        assert!(peer_exists(&c, "new", "b") && !peer_exists(&c, "old", "b"));
+        let got = tool_poll(&c, "new", "b").unwrap();
+        assert_eq!(got["count"], 1);
+        assert_eq!(got["messages"][0]["from"], "new/a");
+
+        // target-name collision refused
+        tool_create_team(&c, "taken").unwrap();
+        assert_eq!(tool_rename_team(&c, "new", "taken").unwrap()["ok"], false);
     }
 
     #[test]
