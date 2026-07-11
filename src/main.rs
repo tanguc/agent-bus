@@ -1322,6 +1322,28 @@ fn cli_doctor(flags: &HashMap<String, String>) {
         "note":   if approved { "" } else { "run 'agent-bus install' to auto-approve" }
     }));
 
+    // 4b. agent-bus artifacts must stay local — never pushed to a remote
+    let mut leaks: Vec<String> = vec![];
+    for art in ["CLAUDE.local.md", ".mcp.json"] {
+        if !cwd.join(art).exists() { continue; }
+        if is_git_tracked(&cwd, art) {
+            leaks.push(format!("{} is tracked by git (will be pushed) — should be local-only", art));
+        } else if !is_git_ignored(&cwd, art) {
+            leaks.push(format!("{} is neither tracked nor excluded — add it to .git/info/exclude", art));
+        }
+    }
+    // the bootstrap block must not sit in a tracked CLAUDE.md
+    let cm = cwd.join("CLAUDE.md");
+    if cm.exists() && is_git_tracked(&cwd, "CLAUDE.md")
+        && fs::read_to_string(&cm).unwrap_or_default().contains(BLOCK_START) {
+        leaks.push("CLAUDE.md is tracked and still holds the agent-bus bootstrap block — run 'agent-bus install' to migrate it".into());
+    }
+    if leaks.is_empty() {
+        checks.push(json!({"check":"artifacts_local","status":"ok"}));
+    } else {
+        checks.push(json!({"check":"artifacts_local","status":"warn","note":leaks.join("; ")}));
+    }
+
     // 5. peer staleness + open tasks (only if db exists)
     if db.exists() {
         let conn = open_db();
@@ -1649,6 +1671,16 @@ fn is_git_tracked(dir: &Path, file: &str) -> bool {
         .args(["ls-files", "--error-unmatch", file])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+// true if git would ignore this path — honours .gitignore AND .git/info/exclude
+fn is_git_ignored(dir: &Path, file: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C").arg(dir)
+        .args(["check-ignore", "-q", file])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
