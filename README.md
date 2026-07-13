@@ -54,6 +54,23 @@ auto-enables the server by adding `"enabledMcpjsonServers": ["agent-bus"]` to th
 `.claude/settings.local.json` (targeted + personal/gitignored). To approve broadly instead,
 set `"enableAllProjectMcpServers": true` in `~/.claude/settings.json`.
 
+## Config-drift detection
+
+`.mcp.json` is machine-local (git-excluded, never committed). If it goes missing — a
+`git clean`, a reclone, or a formerly-committed copy deleted by a branch switch — the MCP
+server silently falls back to a parent-scope identity and the session mis-registers.
+
+- The per-repo installer wires a `SessionStart` hook that runs `agent-bus doctor --quiet`
+  before `poll`, so drift surfaces in the session's startup context. `doctor` recovers the
+  **expected** identity from the hook flags or the `CLAUDE.local.md` bootstrap and warns when
+  the local `.mcp.json` is missing or points elsewhere.
+- `agent-bus doctor --repair` recreates a missing/mismatched `.mcp.json` from the expected
+  identity (explicit — it never auto-reverts an intentional re-team).
+- `agent-bus install-hook` adds a **global** `SessionStart` hook to `~/.claude/settings.json`
+  (`agent-bus doctor --quiet`). It runs in every session — silent in non-agent-bus repos,
+  drift-checking in agent-bus ones — so detection survives even a wiped per-repo `.claude/`.
+  It merges into existing hooks and backs the file up first.
+
 ### What the config looks like (Claude `.mcp.json`)
 ```json
 {

@@ -445,6 +445,83 @@ fn mcp_identity(mcp_path: &Path) -> Option<(String, String)> {
           env["AGENT_BUS_ALIAS"].as_str()?.to_string()))
 }
 
+fn value_after(tokens: &[&str], flag: &str) -> Option<String> {
+    tokens.iter().position(|t| *t == flag)
+        .and_then(|i| tokens.get(i + 1))
+        .map(|v| v.trim_matches(|c| c == '"' || c == '\'' || c == ';').to_string())
+}
+
+// the EXPECTED identity, recovered from durable per-repo evidence when .mcp.json is
+// gone: the SessionStart hook's --team/--as, else the CLAUDE.local.md bootstrap line
+fn discover_identity(cwd: &Path) -> Option<(String, String)> {
+    if let Ok(s) = fs::read_to_string(cwd.join(".claude/settings.local.json")) {
+        let toks: Vec<&str> = s.split_whitespace().collect();
+        if let (Some(t), Some(a)) = (value_after(&toks, "--team"), value_after(&toks, "--as")) {
+            return Some((t, a));
+        }
+    }
+    if let Ok(s) = fs::read_to_string(cwd.join("CLAUDE.local.md")) {
+        // ...identity `team/alias`...
+        if let Some(i) = s.find("identity `") {
+            let rest = &s[i + "identity `".len()..];
+            if let Some(end) = rest.find('`') {
+                if let Some((t, a)) = rest[..end].split_once('/') {
+                    return Some((t.to_string(), a.to_string()));
+                }
+            }
+        }
+    }
+    None
+}
+
+// any local marker that this dir is an agent-bus repo (so a global hook can run
+// `doctor --quiet` everywhere and stay silent in unrelated projects)
+fn is_agentbus_repo(cwd: &Path) -> bool {
+    let has = |rel: &str, needle: &str| {
+        fs::read_to_string(cwd.join(rel)).map(|s| s.contains(needle)).unwrap_or(false)
+    };
+    has(".mcp.json", "agent-bus")
+        || has("CLAUDE.local.md", BLOCK_START)
+        || has(".claude/settings.local.json", "agent-bus")
+}
+
+fn global_settings_path() -> PathBuf { home_dir().join(".claude").join("settings.json") }
+
+// merge a "agent-bus doctor --quiet" SessionStart hook into a global settings file,
+// preserving every other setting and hook. returns false if it was already there.
+fn add_global_hook(path: &Path) -> bool {
+    let cmd = "agent-bus doctor --quiet";
+    let mut root: Value = fs::read_to_string(path).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    if !root.is_object() { root = json!({}); }
+    let present = root["hooks"]["SessionStart"].as_array().map(|arr| arr.iter().any(|e| {
+        e["hooks"].as_array().map(|h| h.iter().any(|hk|
+            hk["command"].as_str().map(|c| c.contains("agent-bus doctor")).unwrap_or(false)
+        )).unwrap_or(false)
+    })).unwrap_or(false);
+    if present { return false; }
+
+    if !root["hooks"].is_object() { root["hooks"] = json!({}); }
+    let mut starts = root["hooks"]["SessionStart"].as_array().cloned().unwrap_or_default();
+    starts.push(json!({"hooks": [{"type": "command", "command": cmd}]}));
+    root["hooks"]["SessionStart"] = json!(starts);
+    if path.exists() { let _ = fs::copy(path, path.with_extension("json.bak")); }
+    if let Some(p) = path.parent() { let _ = fs::create_dir_all(p); }
+    fs::write(path, serde_json::to_string_pretty(&root).unwrap() + "\n").expect("write global settings.json");
+    true
+}
+
+fn global_hook_present() -> bool {
+    let Ok(s) = fs::read_to_string(global_settings_path()) else { return false };
+    let Ok(v) = serde_json::from_str::<Value>(&s) else { return false };
+    v["hooks"]["SessionStart"].as_array().map(|arr| arr.iter().any(|e| {
+        e["hooks"].as_array().map(|h| h.iter().any(|hk|
+            hk["command"].as_str().map(|c| c.contains("agent-bus doctor")).unwrap_or(false)
+        )).unwrap_or(false)
+    })).unwrap_or(false)
+}
+
 // detect (and with fix, reconcile) bus state left dangling by deletions/renames:
 //   - open tasks addressed to a recipient that is no longer a registered peer
 //   - cursors belonging to a peer that no longer exists
@@ -1206,6 +1283,18 @@ fn need_pos(cmd: &str, pos: &[String], usage: &str) -> String {
     }
 }
 
+fn cli_install_hook(_flags: &HashMap<String, String>) {
+    let path = global_settings_path();
+    let existed = path.exists();
+    if add_global_hook(&path) {
+        println!("● installed global SessionStart hook → {}", path.display());
+        println!("  runs `agent-bus doctor --quiet` at every session start — silent unless it finds config drift");
+        if existed { println!("  backup: {}", path.with_extension("json.bak").display()); }
+    } else {
+        println!("• global drift hook already present in {}", path.display());
+    }
+}
+
 fn cli_sync(flags: &HashMap<String, String>) {
     let conn = open_db();
     let args = json!({"fix": flags.contains_key("fix")});
@@ -1273,6 +1362,11 @@ fn cli_whoami(flags: &HashMap<String, String>) {
     println!("  bus home  {}", bus_home().display());
 }
 fn cli_doctor(flags: &HashMap<String, String>) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    // a global SessionStart hook runs `doctor --quiet` in EVERY repo; stay silent and
+    // do nothing in projects that aren't agent-bus repos
+    if flags.contains_key("quiet") && !is_agentbus_repo(&cwd) { return; }
+
     let mut checks: Vec<Value> = vec![];
     let mut all_ok = true;
 
@@ -1300,7 +1394,6 @@ fn cli_doctor(flags: &HashMap<String, String>) {
     }
 
     // 3. .mcp.json in CWD
-    let cwd = std::env::current_dir().unwrap_or_default();
     let mcp = cwd.join(".mcp.json");
     let mcp_has_bus = mcp.exists()
         && fs::read_to_string(&mcp).unwrap_or_default().contains("agent-bus");
@@ -1316,7 +1409,11 @@ fn cli_doctor(flags: &HashMap<String, String>) {
     // --team/--as. If the local .mcp.json is missing or pins a different identity,
     // the MCP server silently falls back to a parent-scope config (this is exactly
     // how a session mis-registered as the parent identity after .mcp.json vanished).
-    if let (Some(et), Some(ea)) = (flags.get("team"), flags.get("as")) {
+    // expected identity: explicit flags win, else recovered from durable per-repo
+    // evidence (so a bare `doctor --quiet` from the global hook still detects drift)
+    let expected = flags.get("team").cloned().zip(flags.get("as").cloned())
+        .or_else(|| discover_identity(&cwd));
+    if let Some((et, ea)) = expected.as_ref() {
         let actual = mcp_identity(&mcp);
         let matches = actual.as_ref().map(|(t, a)| t == et && a == ea).unwrap_or(false);
         if matches {
@@ -1331,6 +1428,16 @@ fn cli_doctor(flags: &HashMap<String, String>) {
             let was = actual.map(|(t, a)| format!("{}/{}", t, a)).unwrap_or_else(|| "missing".into());
             checks.push(json!({"check":"config","status":"warn",
                 "note":format!("local .mcp.json is {} but should be {}/{} — MCP falls back to a parent identity. run 'agent-bus doctor --team {} --as {} --repair' then restart", was, et, ea, et, ea)}));
+        }
+    }
+
+    // 3c. is the wipe-proof global drift hook installed? (info-level, hidden by --quiet)
+    if is_agentbus_repo(&cwd) {
+        if global_hook_present() {
+            checks.push(json!({"check":"global_hook","status":"ok"}));
+        } else {
+            checks.push(json!({"check":"global_hook","status":"info",
+                "note":"no global drift hook — run 'agent-bus install-hook' to catch config drift even if this repo's .claude/ is wiped"}));
         }
     }
 
@@ -1427,7 +1534,8 @@ fn cli_doctor(flags: &HashMap<String, String>) {
     // (used by the SessionStart hook so a clean start adds no noise)
     let quiet = flags.contains_key("quiet");
     let shown: Vec<&Value> = if quiet {
-        checks.iter().filter(|c| c["status"] != "ok").collect()
+        // only actionable problems in the session-start context; hide ok + info
+        checks.iter().filter(|c| matches!(c["status"].as_str(), Some("warn") | Some("fail"))).collect()
     } else {
         checks.iter().collect()
     };
@@ -1447,6 +1555,7 @@ fn cli_doctor(flags: &HashMap<String, String>) {
         let sym = match c["status"].as_str().unwrap_or("") {
             "ok"   => "✓",
             "warn" => "!",
+            "info" => "·",
             _      => "✗",
         };
         // surface whichever detail this check carries
@@ -2083,6 +2192,7 @@ fn spec(cmd: &str) -> (&'static [&'static str], usize) {
         "unregister"           => (&["team", "as", "alias"], 1), // positional: alias or team/alias
         "whoami"               => (&["team", "as"], 0),
         "doctor"               => (&["team", "as", "quiet", "repair"], 0),
+        "install-hook"         => (&[], 0),
         "sync"                 => (&["fix"], 0),
         _                      => (&[], 0),
     }
@@ -2110,6 +2220,7 @@ fn usage() -> &'static str {
      whoami\n\
      doctor [--team t --as a] [--quiet] [--repair]   per-agent health + config drift;\n\
      \x20                            --repair recreates a missing/mismatched .mcp.json\n\
+     install-hook                  add a global SessionStart drift-check to ~/.claude/settings.json\n\
      sync [--fix]                  find bus-wide orphans (dead recipients/cursors); --fix reconciles\n\
      version\n\
      \n\
@@ -2141,7 +2252,7 @@ fn main() {
         "", "setup", "serve", "install", "send", "poll", "peek", "history", "tasks",
         "prune", "peers", "roster", "teams", "create-team", "delete-team",
         "rename-team", "register", "unregister", "whoami",
-        "doctor", "sync", "version", "--version", "-V",
+        "doctor", "install-hook", "sync", "version", "--version", "-V",
     ];
     if !COMMANDS.contains(&cmd) {
         eprintln!("error: unknown command `{}`\n", cmd);
@@ -2172,6 +2283,7 @@ fn main() {
         "unregister"          => cli_unregister(&flags, &pos),
         "whoami"              => cli_whoami(&flags),
         "doctor"              => cli_doctor(&flags),
+        "install-hook"        => cli_install_hook(&flags),
         "sync"                => cli_sync(&flags),
         "version" | "--version" | "-V" => println!("{}", version_string()),
         "" | "setup"          => wizard(),
@@ -2535,6 +2647,55 @@ mod tests {
         // idempotent: a second sync finds nothing
         let r = tool_sync(&c, true).unwrap();
         assert_eq!(r["orphaned_tasks"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn discover_identity_from_hook_and_bootstrap() {
+        let dir = std::env::temp_dir().join(format!("ab-disc-{}", short_id()));
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        // from the SessionStart hook's --team/--as
+        std::fs::write(dir.join(".claude/settings.local.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"agent-bus doctor --team astrub --as classic --quiet; agent-bus poll --team astrub --as classic"}]}]}}"#).unwrap();
+        assert_eq!(discover_identity(&dir), Some(("astrub".into(), "classic".into())));
+        assert!(is_agentbus_repo(&dir));
+
+        // from the CLAUDE.local.md bootstrap when no settings hook
+        let dir2 = std::env::temp_dir().join(format!("ab-disc2-{}", short_id()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir2.join("CLAUDE.local.md"),
+            format!("{}\nidentity `sergen/infra-home`.\n{}", BLOCK_START, BLOCK_END)).unwrap();
+        assert_eq!(discover_identity(&dir2), Some(("sergen".into(), "infra-home".into())));
+        assert!(is_agentbus_repo(&dir2));
+
+        // a non-agent-bus dir yields nothing
+        let dir3 = std::env::temp_dir().join(format!("ab-disc3-{}", short_id()));
+        std::fs::create_dir_all(&dir3).unwrap();
+        assert_eq!(discover_identity(&dir3), None);
+        assert!(!is_agentbus_repo(&dir3));
+
+        std::fs::remove_dir_all(&dir).ok(); std::fs::remove_dir_all(&dir2).ok(); std::fs::remove_dir_all(&dir3).ok();
+    }
+
+    #[test]
+    fn add_global_hook_preserves_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("ab-gh-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("settings.json");
+        // pre-existing unrelated SessionStart hook + other settings must survive
+        std::fs::write(&p, r#"{"model":"x","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash other.sh"}]}]}}"#).unwrap();
+
+        assert!(add_global_hook(&p));            // added
+        assert!(!add_global_hook(&p));           // idempotent — already there
+
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["model"], "x");             // other settings intact
+        let arr = v["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);                // existing + ours
+        let cmds: Vec<&str> = arr.iter().flat_map(|e| e["hooks"].as_array().unwrap())
+            .filter_map(|h| h["command"].as_str()).collect();
+        assert!(cmds.iter().any(|c| c.contains("bash other.sh")));
+        assert!(cmds.iter().any(|c| c.contains("agent-bus doctor --quiet")));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
