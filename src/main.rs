@@ -451,38 +451,46 @@ fn value_after(tokens: &[&str], flag: &str) -> Option<String> {
         .map(|v| v.trim_matches(|c| c == '"' || c == '\'' || c == ';').to_string())
 }
 
-// the EXPECTED identity, recovered from durable per-repo evidence when .mcp.json is
-// gone: the SessionStart hook's --team/--as, else the CLAUDE.local.md bootstrap line
-fn discover_identity(cwd: &Path) -> Option<(String, String)> {
-    if let Ok(s) = fs::read_to_string(cwd.join(".claude/settings.local.json")) {
-        let toks: Vec<&str> = s.split_whitespace().collect();
-        if let (Some(t), Some(a)) = (value_after(&toks, "--team"), value_after(&toks, "--as")) {
-            return Some((t, a));
-        }
-    }
-    if let Ok(s) = fs::read_to_string(cwd.join("CLAUDE.local.md")) {
-        // ...identity `team/alias`...
-        if let Some(i) = s.find("identity `") {
-            let rest = &s[i + "identity `".len()..];
-            if let Some(end) = rest.find('`') {
-                if let Some((t, a)) = rest[..end].split_once('/') {
-                    return Some((t.to_string(), a.to_string()));
-                }
+// pull --team/--as out of the agent-bus SessionStart hook command, if present.
+// parse the JSON and read the command string — never whitespace-split the raw file,
+// or the next token picks up JSON punctuation (e.g. `agent-bus-repo",`).
+fn identity_from_settings(cwd: &Path) -> Option<(String, String)> {
+    let s = fs::read_to_string(cwd.join(".claude/settings.local.json")).ok()?;
+    let v: Value = serde_json::from_str(&s).ok()?;
+    for e in v["hooks"]["SessionStart"].as_array()? {
+        for h in e["hooks"].as_array().into_iter().flatten() {
+            let cmd = h["command"].as_str().unwrap_or("");
+            if !cmd.contains("agent-bus") { continue; }
+            let toks: Vec<&str> = cmd.split_whitespace().collect();
+            if let (Some(t), Some(a)) = (value_after(&toks, "--team"), value_after(&toks, "--as")) {
+                return Some((t, a));
             }
         }
     }
     None
 }
 
-// any local marker that this dir is an agent-bus repo (so a global hook can run
-// `doctor --quiet` everywhere and stay silent in unrelated projects)
+fn identity_from_bootstrap(cwd: &Path) -> Option<(String, String)> {
+    let s = fs::read_to_string(cwd.join("CLAUDE.local.md")).ok()?;
+    let i = s.find("identity `")?;
+    let rest = &s[i + "identity `".len()..];
+    let end = rest.find('`')?;
+    let (t, a) = rest[..end].split_once('/')?;
+    Some((t.to_string(), a.to_string()))
+}
+
+// the EXPECTED identity, recovered from durable per-repo evidence when .mcp.json is
+// gone: the SessionStart hook's --team/--as, else the CLAUDE.local.md bootstrap line
+fn discover_identity(cwd: &Path) -> Option<(String, String)> {
+    identity_from_settings(cwd).or_else(|| identity_from_bootstrap(cwd))
+}
+
+// is this dir actually an agent-bus repo? judged by real config (an agent-bus
+// .mcp.json entry, or a recoverable identity), NOT a stray "agent-bus" substring —
+// so a global `doctor --quiet` stays silent in unrelated projects (e.g. a home dir
+// whose settings just allow the agent-bus MCP tools)
 fn is_agentbus_repo(cwd: &Path) -> bool {
-    let has = |rel: &str, needle: &str| {
-        fs::read_to_string(cwd.join(rel)).map(|s| s.contains(needle)).unwrap_or(false)
-    };
-    has(".mcp.json", "agent-bus")
-        || has("CLAUDE.local.md", BLOCK_START)
-        || has(".claude/settings.local.json", "agent-bus")
+    mcp_identity(&cwd.join(".mcp.json")).is_some() || discover_identity(cwd).is_some()
 }
 
 fn global_settings_path() -> PathBuf { home_dir().join(".claude").join("settings.json") }
@@ -2674,6 +2682,29 @@ mod tests {
         assert!(!is_agentbus_repo(&dir3));
 
         std::fs::remove_dir_all(&dir).ok(); std::fs::remove_dir_all(&dir2).ok(); std::fs::remove_dir_all(&dir3).ok();
+    }
+
+    #[test]
+    fn discover_ignores_punctuation_and_permission_mentions() {
+        // old poll-only hook: --as value sits at the end of the command. must parse
+        // clean via JSON, not whitespace-split the raw file (which yielded `x",`)
+        let d1 = std::env::temp_dir().join(format!("ab-p1-{}", short_id()));
+        std::fs::create_dir_all(d1.join(".claude")).unwrap();
+        std::fs::write(d1.join(".claude/settings.local.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"agent-bus poll --team default --as agent-bus-repo"}]}]}}"#).unwrap();
+        assert_eq!(discover_identity(&d1), Some(("default".into(), "agent-bus-repo".into())));
+        assert!(is_agentbus_repo(&d1));
+
+        // "agent-bus" only in a permission allowlist (no hook, no .mcp.json, no
+        // bootstrap) must NOT count as an agent-bus repo
+        let d2 = std::env::temp_dir().join(format!("ab-p2-{}", short_id()));
+        std::fs::create_dir_all(d2.join(".claude")).unwrap();
+        std::fs::write(d2.join(".claude/settings.local.json"),
+            r#"{"permissions":{"allow":["mcp__agent-bus__poll","mcp__agent-bus__send"]}}"#).unwrap();
+        assert_eq!(discover_identity(&d2), None);
+        assert!(!is_agentbus_repo(&d2));
+
+        std::fs::remove_dir_all(&d1).ok(); std::fs::remove_dir_all(&d2).ok();
     }
 
     #[test]
