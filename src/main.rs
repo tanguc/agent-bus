@@ -1312,6 +1312,28 @@ fn cli_doctor(flags: &HashMap<String, String>) {
         checks.push(json!({"check":".mcp.json","status":"warn","note":"not found in CWD — run 'agent-bus install'"}));
     }
 
+    // 3b. config drift — the SessionStart hook passes the EXPECTED identity via
+    // --team/--as. If the local .mcp.json is missing or pins a different identity,
+    // the MCP server silently falls back to a parent-scope config (this is exactly
+    // how a session mis-registered as the parent identity after .mcp.json vanished).
+    if let (Some(et), Some(ea)) = (flags.get("team"), flags.get("as")) {
+        let actual = mcp_identity(&mcp);
+        let matches = actual.as_ref().map(|(t, a)| t == et && a == ea).unwrap_or(false);
+        if matches {
+            checks.push(json!({"check":"config","status":"ok","note":format!("{}/{}", et, ea)}));
+        } else if flags.contains_key("repair") {
+            let exe = std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| "agent-bus".into());
+            write_mcp_config(&cwd.to_string_lossy(), et, ea, &exe);
+            if let Ok(canon) = cwd.canonicalize() { add_git_excludes(&canon); }
+            checks.push(json!({"check":"config","status":"warn",
+                "note":format!("recreated .mcp.json -> {}/{} — restart the session to bind it (current MCP connection still on the old identity)", et, ea)}));
+        } else {
+            let was = actual.map(|(t, a)| format!("{}/{}", t, a)).unwrap_or_else(|| "missing".into());
+            checks.push(json!({"check":"config","status":"warn",
+                "note":format!("local .mcp.json is {} but should be {}/{} — MCP falls back to a parent identity. run 'agent-bus doctor --team {} --as {} --repair' then restart", was, et, ea, et, ea)}));
+        }
+    }
+
     // 4. MCP auto-approved
     let settings = cwd.join(".claude").join("settings.local.json");
     let approved = settings.exists()
@@ -1401,13 +1423,27 @@ fn cli_doctor(flags: &HashMap<String, String>) {
     let v = json!({"ok": all_ok, "checks": checks});
     if flags.contains_key("json") { println!("{}", v); return; }
 
+    // --quiet: print only non-ok checks; stay completely silent when healthy
+    // (used by the SessionStart hook so a clean start adds no noise)
+    let quiet = flags.contains_key("quiet");
+    let shown: Vec<&Value> = if quiet {
+        checks.iter().filter(|c| c["status"] != "ok").collect()
+    } else {
+        checks.iter().collect()
+    };
+    if quiet && shown.is_empty() {
+        if !all_ok { std::process::exit(1); }
+        return;
+    }
+
     let warns = checks.iter().filter(|c| c["status"] == "warn").count();
     let headline = if !all_ok        { "issues found".to_string() }
                    else if warns > 0 { format!("{} warning{}", warns, plural(warns)) }
                    else              { "all checks passed".to_string() };
-    println!("● doctor — {}\n", headline);
-    let w = checks.iter().filter_map(|c| c["check"].as_str()).map(|s| s.chars().count()).max().unwrap_or(0);
-    for c in &checks {
+    if quiet { println!("● agent-bus doctor — {}\n", headline); }
+    else     { println!("● doctor — {}\n", headline); }
+    let w = shown.iter().filter_map(|c| c["check"].as_str()).map(|s| s.chars().count()).max().unwrap_or(0);
+    for c in &shown {
         let sym = match c["status"].as_str().unwrap_or("") {
             "ok"   => "✓",
             "warn" => "!",
@@ -1805,7 +1841,13 @@ fn wire_session_hook(repo: &str, team: &str, alias: &str) {
     };
     if !root.is_object() { root = json!({}); }
 
-    let hook_cmd = format!("agent-bus poll --team {} --as {}", team, alias);
+    // doctor --quiet first: it surfaces config/identity drift (e.g. a missing
+    // .mcp.json making the session fall back to a parent identity) in the session's
+    // startup context, before poll runs. --team/--as pin the *expected* identity.
+    let hook_cmd = format!(
+        "agent-bus doctor --team {t} --as {a} --quiet; agent-bus poll --team {t} --as {a}",
+        t = team, a = alias
+    );
 
     // check if our hook already exists
     let already = root["hooks"]["SessionStart"]
@@ -1860,20 +1902,26 @@ fn migrate_legacy_block(repo: &Path) {
     }
 }
 
-fn install_claude(repo: &str, team: &str, alias: &str, exe: &str) {
+// write/refresh the agent-bus entry in a repo's .mcp.json, preserving other servers
+fn write_mcp_config(repo: &str, team: &str, alias: &str, exe: &str) -> PathBuf {
     let mcp_path = PathBuf::from(repo).join(".mcp.json");
     let mut root: Value = if mcp_path.exists() {
         serde_json::from_str(&fs::read_to_string(&mcp_path).unwrap_or_default()).unwrap_or(json!({}))
     } else {
         json!({})
     };
-    if !root.is_object()         { root = json!({}); }
+    if !root.is_object()               { root = json!({}); }
     if !root["mcpServers"].is_object() { root["mcpServers"] = json!({}); }
     root["mcpServers"]["agent-bus"] = json!({
         "command": exe, "args": ["serve"],
         "env": {"AGENT_BUS_TEAM": team, "AGENT_BUS_ALIAS": alias}
     });
     fs::write(&mcp_path, serde_json::to_string_pretty(&root).unwrap() + "\n").expect("write .mcp.json");
+    mcp_path
+}
+
+fn install_claude(repo: &str, team: &str, alias: &str, exe: &str) {
+    let mcp_path = write_mcp_config(repo, team, alias, exe);
     println!("wrote {}", mcp_path.display());
 
     // the bootstrap hardcodes machine-specific inbox paths, so it belongs in
@@ -1975,7 +2023,7 @@ Monitor(persistent:true, timeout_ms:3600000, command: |\n\
 // positionals used to be silently discarded, so `unregister foo --team t` dropped
 // `foo` and fell back to the caller's own alias — deleting the wrong peer
 // valueless flags must not swallow the next token, or `--unread foo` eats `foo`
-const BOOL_FLAGS: &[&str] = &["json", "help", "h", "unread", "no-interactive", "force", "fix"];
+const BOOL_FLAGS: &[&str] = &["json", "help", "h", "unread", "no-interactive", "force", "fix", "quiet", "repair"];
 
 fn parse_args(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
     let mut m = HashMap::new();
@@ -2034,7 +2082,7 @@ fn spec(cmd: &str) -> (&'static [&'static str], usize) {
         "register"             => (&["card", "team", "as"], 0),
         "unregister"           => (&["team", "as", "alias"], 1), // positional: alias or team/alias
         "whoami"               => (&["team", "as"], 0),
-        "doctor"               => (&[], 0),
+        "doctor"               => (&["team", "as", "quiet", "repair"], 0),
         "sync"                 => (&["fix"], 0),
         _                      => (&[], 0),
     }
@@ -2060,7 +2108,8 @@ fn usage() -> &'static str {
      register [--card ..] [--team t] [--as a]\n\
      unregister [alias | team/alias]    defaults to self if no target given\n\
      whoami\n\
-     doctor                        per-agent health, incl. identity/bus drift\n\
+     doctor [--team t --as a] [--quiet] [--repair]   per-agent health + config drift;\n\
+     \x20                            --repair recreates a missing/mismatched .mcp.json\n\
      sync [--fix]                  find bus-wide orphans (dead recipients/cursors); --fix reconciles\n\
      version\n\
      \n\
@@ -2486,6 +2535,21 @@ mod tests {
         // idempotent: a second sync finds nothing
         let r = tool_sync(&c, true).unwrap();
         assert_eq!(r["orphaned_tasks"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn write_mcp_config_roundtrips_and_preserves_others() {
+        let dir = std::env::temp_dir().join(format!("ab-wmc-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // pre-existing unrelated server must survive a rewrite
+        std::fs::write(dir.join(".mcp.json"),
+            r#"{"mcpServers":{"other":{"command":"x"}}}"#).unwrap();
+        let p = write_mcp_config(&dir.to_string_lossy(), "sergen", "infra-home", "/bin/agent-bus");
+        assert_eq!(mcp_identity(&p), Some(("sergen".into(), "infra-home".into())));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["agent-bus"]["command"], "/bin/agent-bus");
+        assert_eq!(v["mcpServers"]["other"]["command"], "x"); // untouched
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
