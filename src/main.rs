@@ -155,6 +155,31 @@ fn resolve_to(to: &str, my_team: &str) -> (String, String) {
     }
 }
 
+// actionable unread for a peer: messages addressed to it, minus its own sends,
+// that it has not yet received a receipt for. This is the same notion poll() drains,
+// so the flag reflects "real inbound mail" — not receipts or self-echo.
+fn unread_count(conn: &Connection, team: &str, alias: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM messages m \
+         WHERE ((m.recipient_team=?1 AND (m.recipient_alias=?2 OR m.recipient_alias='*')) \
+                OR (m.recipient_team='*' AND m.recipient_alias='*')) \
+         AND NOT (m.sender_team=?1 AND m.sender_alias=?2) \
+         AND NOT EXISTS (SELECT 1 FROM receipts r \
+             WHERE r.message_id=m.id AND r.reader_team=?1 AND r.reader_alias=?2)",
+        params![team, alias],
+        |r| r.get(0),
+    ).unwrap_or(0)
+}
+
+// the flag's CONTENT is the recipient's actionable-unread count. A watcher compares
+// content, not mtime — so it never fires on a receipt/self-write (count unchanged) and
+// never misses a same-second recreation (count differs). Fixes the whole-second race.
+fn write_flag(conn: &Connection, team: &str, alias: &str) {
+    let fp = flag_path(team, alias);
+    if let Some(parent) = fp.parent() { fs::create_dir_all(parent).ok(); }
+    let _ = fs::write(fp, unread_count(conn, team, alias).to_string());
+}
+
 fn touch_doorbell(conn: &Connection, rt: &str, ra: &str, my_team: &str, my_alias: &str) {
     let targets: Vec<(String, String)> = if ra == "*" {
         let (sql, p): (&str, Vec<String>) = if rt == "*" {
@@ -181,11 +206,7 @@ fn touch_doorbell(conn: &Connection, rt: &str, ra: &str, my_team: &str, my_alias
         if t == my_team && a == my_alias {
             continue;
         }
-        let fp = flag_path(&t, &a);
-        if let Some(parent) = fp.parent() {
-            fs::create_dir_all(parent).ok();
-        }
-        let _ = fs::write(fp, now_ms().to_string());
+        write_flag(conn, &t, &a);
     }
 }
 
@@ -259,6 +280,18 @@ fn tool_send(conn: &Connection, team: &str, alias: &str, args: &Value) -> rusqli
     touch_doorbell(conn, &rt, &ra, team, alias);
 
     let mut out = json!({"ok": true, "id": id, "task_id": task_id, "to": format!("{}/{}", rt, ra)});
+    // agent-bus stores the full body (verified: TEXT column, no cap), but the MCP
+    // transport can truncate a large tool argument ABOVE agent-bus. we can't stop that,
+    // but we can tell the sender the byte size so it knows to chunk a huge message.
+    let bytes = body.len();
+    out["bytes"] = json!(bytes);
+    if bytes > 32_768 {
+        out["large"] = json!(true);
+        out["note"] = json!(format!(
+            "body is {} bytes — the MCP transport may truncate very large messages; consider splitting into numbered chunks",
+            bytes
+        ));
+    }
     // a direct send to an unregistered identity is still delivered if that agent later
     // registers under it (poll matches on recipient, cursor starts at 0) — but a typo'd
     // alias is a silent black hole, so surface the ambiguity instead of hiding it
@@ -304,7 +337,6 @@ fn tool_poll(conn: &Connection, team: &str, alias: &str) -> rusqlite::Result<Val
              ON CONFLICT(team, alias) DO UPDATE SET last_id=?3",
             params![team, alias, newlast],
         )?;
-        let _ = fs::remove_file(flag_path(team, alias));
     }
 
     // write receipts for all delivered messages
@@ -317,6 +349,10 @@ fn tool_poll(conn: &Connection, team: &str, alias: &str) -> rusqlite::Result<Val
             params![mid, team, alias, now_ms()],
         )?;
     }
+
+    // refresh the flag to the post-drain count (0 once caught up), so a watcher
+    // that reads the flag sees the drop instead of a stale positive
+    write_flag(conn, team, alias);
 
     Ok(json!({"ok": true, "count": msgs.len(), "messages": msgs}))
 }
@@ -383,9 +419,12 @@ fn tool_peek(conn: &Connection, args: &Value) -> rusqlite::Result<Value> {
     Ok(json!({"ok": true, "count": msgs.len(), "messages": msgs}))
 }
 
-// task rollup — latest state per task_id, using first message for from/to/type
+// task rollup — latest state per task_id, using first message for from/to/type.
+// bounded: default filter is 'open' + a row LIMIT + a per-task body preview, so the
+// result stays small (the old default returned every task, all teams — a 2.2M blob).
 fn tool_tasks(conn: &Connection, team: &str, alias: &str, args: &Value) -> rusqlite::Result<Value> {
-    let filter = args["filter"].as_str().unwrap_or("all");
+    let filter = args["filter"].as_str().unwrap_or("open"); // was "all"
+    let limit  = args["limit"].as_i64().unwrap_or(50).clamp(1, 1000);
 
     let base = "SELECT fm.task_id, fm.type, lm.state, \
                 fm.sender_team, fm.sender_alias, fm.recipient_team, fm.recipient_alias, \
@@ -395,35 +434,42 @@ fn tool_tasks(conn: &Connection, team: &str, alias: &str, args: &Value) -> rusql
                             FROM messages GROUP BY task_id) agg ON fm.id = agg.first_id \
                 INNER JOIN messages lm ON lm.id = agg.last_id";
 
-    let tasks: Vec<Value> = match filter {
+    let mut tasks: Vec<Value> = match filter {
         "open" => {
             // 'info' is a status state, not open work — must match doctor's open_tasks count
-            let sql = format!("{} WHERE lm.state NOT IN ('completed','failed','info') ORDER BY lm.created_at DESC", base);
+            let sql = format!("{} WHERE lm.state NOT IN ('completed','failed','info') ORDER BY lm.created_at DESC LIMIT ?1", base);
             let mut stmt = conn.prepare(&sql)?;
-            let x = stmt.query_map([], task_row)?.collect::<rusqlite::Result<Vec<_>>>()?; x
+            let x = stmt.query_map(params![limit], task_row)?.collect::<rusqlite::Result<Vec<_>>>()?; x
         }
         "mine" => {
-            let sql = format!("{} WHERE fm.sender_team=?1 AND fm.sender_alias=?2 ORDER BY lm.created_at DESC", base);
+            let sql = format!("{} WHERE fm.sender_team=?1 AND fm.sender_alias=?2 ORDER BY lm.created_at DESC LIMIT ?3", base);
             let mut stmt = conn.prepare(&sql)?;
-            let x = stmt.query_map(params![team, alias], task_row)?.collect::<rusqlite::Result<Vec<_>>>()?; x
+            let x = stmt.query_map(params![team, alias, limit], task_row)?.collect::<rusqlite::Result<Vec<_>>>()?; x
         }
         "for-me" | "for_me" => {
             let sql = format!(
                 "{} WHERE (fm.recipient_team=?1 AND (fm.recipient_alias=?2 OR fm.recipient_alias='*')) \
-                 OR fm.recipient_team='*' ORDER BY lm.created_at DESC",
+                 OR fm.recipient_team='*' ORDER BY lm.created_at DESC LIMIT ?3",
                 base
             );
             let mut stmt = conn.prepare(&sql)?;
-            let x = stmt.query_map(params![team, alias], task_row)?.collect::<rusqlite::Result<Vec<_>>>()?; x
+            let x = stmt.query_map(params![team, alias, limit], task_row)?.collect::<rusqlite::Result<Vec<_>>>()?; x
         }
-        _ => {
-            let sql = format!("{} ORDER BY lm.created_at DESC", base);
+        _ => { // "all"
+            let sql = format!("{} ORDER BY lm.created_at DESC LIMIT ?1", base);
             let mut stmt = conn.prepare(&sql)?;
-            let x = stmt.query_map([], task_row)?.collect::<rusqlite::Result<Vec<_>>>()?; x
+            let x = stmt.query_map(params![limit], task_row)?.collect::<rusqlite::Result<Vec<_>>>()?; x
         }
     };
 
-    Ok(json!({"ok": true, "count": tasks.len(), "filter": filter, "tasks": tasks}))
+    // keep each rollup row compact — the full thread is available via peek --task-id
+    for t in &mut tasks {
+        if let Some(b) = t["body"].as_str() {
+            if b.chars().count() > 200 { t["body"] = json!(ellipsis(b, 200)); }
+        }
+    }
+
+    Ok(json!({"ok": true, "count": tasks.len(), "filter": filter, "limit": limit, "tasks": tasks}))
 }
 
 fn tool_prune(conn: &Connection, args: &Value) -> rusqlite::Result<Value> {
@@ -1031,9 +1077,10 @@ fn tools_list() -> Value {
         },
         {
             "name": "tasks",
-            "description": "Task rollup: one row per task_id showing latest state. filter: all|open|mine|for-me",
+            "description": "Task rollup: one row per task_id showing latest state, newest first. Bounded (default filter=open, limit=50, bodies previewed) — use peek(task_id) for a full thread. filter: all|open|mine|for-me",
             "inputSchema": {"type":"object","properties":{
-                "filter": {"type":"string","enum":["all","open","mine","for-me"],"description":"default: all"}
+                "filter": {"type":"string","enum":["all","open","mine","for-me"],"description":"default: open"},
+                "limit":  {"type":"integer","description":"max task rows (default 50, max 1000)"}
             }}
         },
         {
@@ -1163,6 +1210,7 @@ fn cli_tasks(flags: &HashMap<String, String>) {
     let conn = open_db();
     let mut args = json!({});
     if let Some(v) = flags.get("filter") { args["filter"] = json!(v); }
+    if let Some(v) = flags.get("limit") { if let Ok(n) = v.parse::<i64>() { args["limit"] = json!(n); } }
     emit("tasks", &call_tool(&conn, &cli_team(flags), &cli_alias(flags), "tasks", &args), flags);
 }
 fn cli_peers(flags: &HashMap<String, String>) {
@@ -1300,6 +1348,68 @@ fn cli_install_hook(_flags: &HashMap<String, String>) {
         if existed { println!("  backup: {}", path.with_extension("json.bak").display()); }
     } else {
         println!("• global drift hook already present in {}", path.display());
+    }
+}
+
+fn lock_path(team: &str, alias: &str) -> PathBuf {
+    inbox_dir().join(team).join(format!("{}.watcher.pid", alias))
+}
+
+fn pid_alive(pid: i32) -> bool {
+    // signal 0 = existence check
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+// native, self-healing doorbell. one watcher per identity: a PID lockfile lets a new
+// watcher kill a stale/duplicate one (fixes the orphan leak). It compares the flag's
+// CONTENT (unread count), initialised from current state (no startup false-positive),
+// so it fires only on a real new inbound message and never on a same-second recreation.
+fn cli_doorbell(flags: &HashMap<String, String>, pos: &[String]) {
+    let team  = flags.get("team").cloned().unwrap_or_else(team_env);
+    let alias = flags.get("as").cloned()
+        .unwrap_or_else(|| std::env::var("AGENT_BUS_ALIAS").unwrap_or_else(|_| "cli".into()));
+    let once  = flags.contains_key("once") || pos.first().map(|s| s == "check").unwrap_or(false);
+
+    let flag = flag_path(&team, &alias);
+    let lock = lock_path(&team, &alias);
+    if let Some(p) = flag.parent() { fs::create_dir_all(p).ok(); }
+
+    // take over from any live previous watcher for this identity
+    if let Ok(s) = fs::read_to_string(&lock) {
+        if let Ok(old) = s.trim().parse::<i32>() {
+            if old != std::process::id() as i32 && pid_alive(old) {
+                unsafe { libc::kill(old, libc::SIGTERM); }
+                eprintln!("[doorbell] replaced stale watcher pid {}", old);
+            }
+        }
+    }
+    let _ = fs::write(&lock, std::process::id().to_string());
+
+    let read_flag = || fs::read_to_string(&flag).ok()
+        .and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0);
+
+    // --once / "check": kill duplicates + emit if there's unread, then exit (for the
+    // SessionStart hook — re-establishes the lock and pings once if mail is waiting)
+    if once {
+        if read_flag() > 0 {
+            println!("BUS: new mail for {}/{} — call agent-bus poll()", team, alias);
+        }
+        return;
+    }
+
+    // long-running watch. init from current state so a pre-drained flag doesn't fire.
+    let mut last = read_flag();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        // if another watcher took the lock, we lost the race — exit quietly
+        if fs::read_to_string(&lock).ok().and_then(|s| s.trim().parse::<i32>().ok())
+            != Some(std::process::id() as i32) { return; }
+        let cur = read_flag();
+        // fire only when unread INCREASED (a genuinely new inbound message)
+        if cur > last {
+            println!("BUS: new mail for {}/{} — call agent-bus poll()", team, alias);
+        }
+        last = cur;
     }
 }
 
@@ -1961,8 +2071,11 @@ fn wire_session_hook(repo: &str, team: &str, alias: &str) {
     // doctor --quiet first: it surfaces config/identity drift (e.g. a missing
     // .mcp.json making the session fall back to a parent identity) in the session's
     // startup context, before poll runs. --team/--as pin the *expected* identity.
+    // doctor (config drift) → poll (drain backlog) → doorbell --once (kill any stale
+    // watcher from a dead session, ping if mail is already waiting). The long-running
+    // watcher itself is armed by the Monitor in the CLAUDE.local.md bootstrap.
     let hook_cmd = format!(
-        "agent-bus doctor --team {t} --as {a} --quiet; agent-bus poll --team {t} --as {a}",
+        "agent-bus doctor --team {t} --as {a} --quiet; agent-bus poll --team {t} --as {a}; agent-bus doorbell --team {t} --as {a} --once",
         t = team, a = alias
     );
 
@@ -2105,22 +2218,19 @@ fn print_copilot(team: &str, alias: &str, exe: &str) {
 }
 
 fn bootstrap_block(team: &str, alias: &str) -> String {
-    let fp = flag_path(team, alias);
     format!(
         "<!-- agent-bus-bootstrap -->\n\
 ## agent-bus (cross-session coordination)\n\
 This repo has the `agent-bus` MCP server, identity `{team}/{alias}`. At session start:\n\
 1. Call `mcp__agent-bus__register` with a short capability card.\n\
 2. Call `mcp__agent-bus__poll` immediately to drain any backlog accumulated during the restart gap.\n\
-3. Arm a doorbell so inbound mail wakes you:\n\
+3. Arm a doorbell so inbound mail wakes you (native, self-healing — one watcher per\n\
+   identity, fires only on real new mail, survives nothing-to-do polls):\n\
 ```\n\
-Monitor(persistent:true, timeout_ms:3600000, command: |\n\
-  f={flag}; last=\"\"; while true; do\n\
-    if [ -f \"$f\" ]; then\n\
-      m=$( (stat -f %m \"$f\" || stat -c %Y \"$f\") 2>/dev/null);\n\
-      if [ \"$m\" != \"$last\" ]; then echo \"BUS: new mail for {team}/{alias} — call agent-bus poll()\"; last=\"$m\"; fi;\n\
-    fi; sleep 2; done)\n\
+Monitor(persistent:true, timeout_ms:3600000, command: agent-bus doorbell --team {team} --as {alias})\n\
 ```\n\
+   The SessionStart hook also runs `agent-bus doorbell --once` to ping you if mail\n\
+   arrived while you were away, and to kill any stale watcher from a dead session.\n\
 4. On a `BUS:` ping, call `mcp__agent-bus__poll` and act on the messages.\n\
 5. Reply with `mcp__agent-bus__send` — to=\"alias\" (same team), \"team/alias\" (cross-team), or \"team:{team}\" (broadcast).\n\
 6. `mcp__agent-bus__peers` lists your team roster (team:\"*\" = everyone).\n\
@@ -2132,7 +2242,7 @@ Monitor(persistent:true, timeout_ms:3600000, command: |\n\
    reply carrying `recipient_registered: false` means the alias may be a typo — compare it\n\
    against `known_peers` in the same reply before retrying.\n\
 <!-- /agent-bus-bootstrap -->",
-        team = team, alias = alias, flag = fp.display()
+        team = team, alias = alias
     )
 }
 
@@ -2140,7 +2250,7 @@ Monitor(persistent:true, timeout_ms:3600000, command: |\n\
 // positionals used to be silently discarded, so `unregister foo --team t` dropped
 // `foo` and fell back to the caller's own alias — deleting the wrong peer
 // valueless flags must not swallow the next token, or `--unread foo` eats `foo`
-const BOOL_FLAGS: &[&str] = &["json", "help", "h", "unread", "no-interactive", "force", "fix", "quiet", "repair"];
+const BOOL_FLAGS: &[&str] = &["json", "help", "h", "unread", "no-interactive", "force", "fix", "quiet", "repair", "once", "all"];
 
 fn parse_args(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
     let mut m = HashMap::new();
@@ -2189,7 +2299,7 @@ fn spec(cmd: &str) -> (&'static [&'static str], usize) {
         "send"                 => (&["to", "body", "type", "state", "task-id", "team", "as"], 0),
         "poll"                 => (&["team", "as"], 0),
         "peek" | "history"     => (&["limit", "task-id", "since-id", "team", "as"], 0),
-        "tasks"                => (&["filter", "team", "as"], 0),
+        "tasks"                => (&["filter", "limit", "team", "as"], 0),
         "prune"                => (&["days", "team", "as"], 0),
         "peers" | "roster"     => (&["team", "unread"], 0),
         "teams"                => (&["no-interactive"], 0),
@@ -2201,6 +2311,7 @@ fn spec(cmd: &str) -> (&'static [&'static str], usize) {
         "whoami"               => (&["team", "as"], 0),
         "doctor"               => (&["team", "as", "quiet", "repair"], 0),
         "install-hook"         => (&[], 0),
+        "doorbell"             => (&["team", "as", "once"], 1), // positional: "check"
         "sync"                 => (&["fix"], 0),
         _                      => (&[], 0),
     }
@@ -2215,7 +2326,8 @@ fn usage() -> &'static str {
      send --to X --body Y [--type task] [--state s] [--task-id id] [--team t] [--as a]\n\
      poll [--team t] [--as a]\n\
      peek [--limit N] [--task-id id] [--since-id N]   read-only; no cursor advance\n\
-     tasks [--filter all|open|mine|for-me]\n\
+     tasks [--filter open|all|mine|for-me] [--limit N]   bounded rollup (default open, 50)\n\
+     doorbell [--team t --as a] [--once]   self-healing inbound-mail watcher\n\
      prune [--days N]\n\
      peers [--team t|*] [--unread]\n\
      roster                        alias for peers (my team)\n\
@@ -2260,7 +2372,7 @@ fn main() {
         "", "setup", "serve", "install", "send", "poll", "peek", "history", "tasks",
         "prune", "peers", "roster", "teams", "create-team", "delete-team",
         "rename-team", "register", "unregister", "whoami",
-        "doctor", "install-hook", "sync", "version", "--version", "-V",
+        "doctor", "doorbell", "install-hook", "sync", "version", "--version", "-V",
     ];
     if !COMMANDS.contains(&cmd) {
         eprintln!("error: unknown command `{}`\n", cmd);
@@ -2291,6 +2403,7 @@ fn main() {
         "unregister"          => cli_unregister(&flags, &pos),
         "whoami"              => cli_whoami(&flags),
         "doctor"              => cli_doctor(&flags),
+        "doorbell"            => cli_doorbell(&flags, &pos),
         "install-hook"        => cli_install_hook(&flags),
         "sync"                => cli_sync(&flags),
         "version" | "--version" | "-V" => println!("{}", version_string()),
@@ -2611,6 +2724,89 @@ mod tests {
         let r = tool_poll(&c, "mycs", "back").unwrap();
         assert_eq!(r["count"], 1);
         assert_eq!(r["messages"][0]["body"], "do the changes");
+    }
+
+    #[test]
+    fn flag_reflects_actionable_unread_not_receipts() {
+        let c = mem();
+        tool_register(&c, "astrub", "classic", &json!({})).unwrap();
+        tool_register(&c, "astrub", "sync",    &json!({})).unwrap();
+
+        // no mail -> 0
+        assert_eq!(unread_count(&c, "astrub", "classic"), 0);
+
+        // sync sends classic a message -> classic's unread = 1
+        tool_send(&c, "astrub", "sync", &json!({"to":"classic","body":"m1"})).unwrap();
+        assert_eq!(unread_count(&c, "astrub", "classic"), 1);
+
+        // classic's OWN send does not raise its own unread (self-echo excluded)
+        tool_send(&c, "astrub", "classic", &json!({"to":"team:astrub","body":"broadcast"})).unwrap();
+        assert_eq!(unread_count(&c, "astrub", "classic"), 1);
+
+        // a receipt (classic reads via poll) drops it back to 0 — the flag would too
+        tool_poll(&c, "astrub", "classic").unwrap();
+        assert_eq!(unread_count(&c, "astrub", "classic"), 0);
+    }
+
+    #[test]
+    fn write_flag_content_tracks_unread() {
+        // the flag CONTENT is the count, so a watcher comparing content (not mtime)
+        // never fires on a receipt and never misses a same-second recreation.
+        // distinct identity from other tests — they share AGENT_BUS_HOME/inbox.
+        let c = mem();
+        tool_register(&c, "flagtest", "rcv", &json!({})).unwrap();
+        tool_register(&c, "flagtest", "snd", &json!({})).unwrap();
+
+        let flag = flag_path("flagtest", "rcv");
+        tool_send(&c, "flagtest", "snd", &json!({"to":"rcv","body":"a"})).unwrap();
+        assert_eq!(fs::read_to_string(&flag).unwrap().trim(), "1");
+        tool_send(&c, "flagtest", "snd", &json!({"to":"rcv","body":"b"})).unwrap();
+        assert_eq!(fs::read_to_string(&flag).unwrap().trim(), "2");
+        tool_poll(&c, "flagtest", "rcv").unwrap();     // drain
+        assert_eq!(fs::read_to_string(&flag).unwrap().trim(), "0"); // refreshed, not deleted
+        let _ = fs::remove_file(&flag);
+    }
+
+    #[test]
+    fn send_flags_oversized_body() {
+        let c = mem();
+        tool_register(&c, "t", "a", &json!({})).unwrap();
+        tool_register(&c, "t", "b", &json!({})).unwrap();
+        let small = tool_send(&c, "t", "a", &json!({"to":"b","body":"hi"})).unwrap();
+        assert!(small["large"].is_null());
+        assert_eq!(small["bytes"], 2);
+
+        let big = "x".repeat(40_000);
+        let r = tool_send(&c, "t", "a", &json!({"to":"b","body":big})).unwrap();
+        assert_eq!(r["large"], true);
+        assert_eq!(r["bytes"], 40_000);
+    }
+
+    #[test]
+    fn tasks_default_open_and_bounded() {
+        let c = mem();
+        tool_register(&c, "t", "a", &json!({})).unwrap();
+        tool_register(&c, "t", "b", &json!({})).unwrap();
+        // one open task + one completed
+        tool_send(&c, "t", "a", &json!({"to":"b","body":"work","type":"task","state":"submitted"})).unwrap();
+        tool_send(&c, "t", "a", &json!({"to":"b","body":"done","type":"task","state":"completed"})).unwrap();
+
+        // default filter is now 'open' (not 'all')
+        let d = tool_tasks(&c, "t", "a", &json!({})).unwrap();
+        assert_eq!(d["filter"], "open");
+        assert_eq!(d["count"], 1);
+
+        // limit is respected and echoed
+        let all = tool_tasks(&c, "t", "a", &json!({"filter":"all","limit":1})).unwrap();
+        assert_eq!(all["limit"], 1);
+        assert_eq!(all["tasks"].as_array().unwrap().len(), 1);
+
+        // long bodies are previewed, not dumped whole
+        tool_send(&c, "t", "a", &json!({"to":"b","body":"z".repeat(5000),"type":"task","state":"working"})).unwrap();
+        let r = tool_tasks(&c, "t", "a", &json!({"filter":"open"})).unwrap();
+        let longest = r["tasks"].as_array().unwrap().iter()
+            .map(|t| t["body"].as_str().unwrap_or("").chars().count()).max().unwrap();
+        assert!(longest <= 200, "body should be previewed to <=200 chars, was {}", longest);
     }
 
     #[test]
