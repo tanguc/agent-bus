@@ -279,7 +279,13 @@ fn tool_send(conn: &Connection, team: &str, alias: &str, args: &Value) -> rusqli
     mark_seen(conn, team, alias)?;
     touch_doorbell(conn, &rt, &ra, team, alias);
 
-    let mut out = json!({"ok": true, "id": id, "task_id": task_id, "to": format!("{}/{}", rt, ra)});
+    let mut out = json!({
+        "ok": true,
+        "id": id,
+        "task_id": task_id,
+        "from": format!("{}/{}", team, alias),
+        "to": format!("{}/{}", rt, ra),
+    });
     // agent-bus stores the full body (verified: TEXT column, no cap), but the MCP
     // transport can truncate a large tool argument ABOVE agent-bus. we can't stop that,
     // but we can tell the sender the byte size so it knows to chunk a huge message.
@@ -302,6 +308,15 @@ fn tool_send(conn: &Connection, team: &str, alias: &str, args: &Value) -> rusqli
             rt, ra
         ));
         out["known_peers"] = json!(all_peer_ids(conn));
+    } else if ra != "*" {
+        let variants = peer_ids_for_alias(conn, &ra);
+        if variants.len() > 1 {
+            out["identity_variants"] = json!(variants);
+            out["warning"] = json!(format!(
+                "alias '{}' is registered in multiple teams — confirm the intended full identity",
+                ra
+            ));
+        }
     }
     Ok(out)
 }
@@ -354,12 +369,17 @@ fn tool_poll(conn: &Connection, team: &str, alias: &str) -> rusqlite::Result<Val
     // that reads the flag sees the drop instead of a stale positive
     write_flag(conn, team, alias);
 
-    Ok(json!({"ok": true, "count": msgs.len(), "messages": msgs}))
+    Ok(json!({
+        "ok": true,
+        "identity": format!("{}/{}", team, alias),
+        "count": msgs.len(),
+        "messages": msgs,
+    }))
 }
 
 // read-only view — does NOT advance cursor or write receipts
 fn tool_peek(conn: &Connection, args: &Value) -> rusqlite::Result<Value> {
-    let limit   = args["limit"].as_i64().unwrap_or(50).max(1).min(1000);
+    let limit   = args["limit"].as_i64().unwrap_or(50).clamp(1, 1000);
     let task_id = args["task_id"].as_str();
     let since_id = args["since_id"].as_i64();
 
@@ -767,6 +787,18 @@ fn all_peer_ids(conn: &Connection) -> Vec<String> {
         Err(_) => return vec![],
     };
     stmt.query_map([], |r| r.get::<_, String>(0))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+fn peer_ids_for_alias(conn: &Connection, alias: &str) -> Vec<String> {
+    let mut stmt = match conn.prepare(
+        "SELECT team || '/' || alias FROM peers WHERE alias=?1 ORDER BY team",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map(params![alias], |r| r.get::<_, String>(0))
         .map(|rows| rows.flatten().collect())
         .unwrap_or_default()
 }
@@ -1365,15 +1397,42 @@ fn lock_path(team: &str, alias: &str) -> PathBuf {
     inbox_dir().join(team).join(format!("{}.watcher.pid", alias))
 }
 
-fn pid_alive(pid: i32) -> bool {
-    // signal 0 = existence check
-    unsafe { libc::kill(pid, 0) == 0 }
+fn read_flag_count(path: &Path) -> i64 {
+    fs::read_to_string(path).ok()
+        .and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0)
 }
 
-// native, self-healing doorbell. one watcher per identity: a PID lockfile lets a new
-// watcher kill a stale/duplicate one (fixes the orphan leak). It compares the flag's
-// CONTENT (unread count), initialised from current state (no startup false-positive),
-// so it fires only on a real new inbound message and never on a same-second recreation.
+fn watcher_pid(path: &Path) -> Option<i32> {
+    fs::read_to_string(path).ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+}
+
+fn ring_doorbell(team: &str, alias: &str) {
+    println!("BUS: new mail for {}/{} — call agent-bus poll()", team, alias);
+}
+
+fn watch_doorbell<F: FnMut()>(
+    flag: &Path,
+    lock: &Path,
+    pid: i32,
+    tick: std::time::Duration,
+    mut ring: F,
+) {
+    let _ = fs::write(lock, pid.to_string());
+    let mut last = read_flag_count(flag);
+    if last > 0 { ring(); }
+
+    loop {
+        std::thread::sleep(tick);
+        if watcher_pid(lock) != Some(pid) { return; }
+        let cur = read_flag_count(flag);
+        if cur > last { ring(); }
+        last = cur;
+    }
+}
+
+// one watcher owns each identity. takeover changes the lock owner; the old watcher sees
+// that on its next tick and exits 0 instead of turning normal replacement into exit 143
 fn cli_doorbell(flags: &HashMap<String, String>, pos: &[String]) {
     let team  = flags.get("team").cloned().unwrap_or_else(team_env);
     let alias = flags.get("as").cloned()
@@ -1381,46 +1440,22 @@ fn cli_doorbell(flags: &HashMap<String, String>, pos: &[String]) {
     let once  = flags.contains_key("once") || pos.first().map(|s| s == "check").unwrap_or(false);
 
     let flag = flag_path(&team, &alias);
-    let lock = lock_path(&team, &alias);
     if let Some(p) = flag.parent() { fs::create_dir_all(p).ok(); }
 
-    // take over from any live previous watcher for this identity
-    if let Ok(s) = fs::read_to_string(&lock) {
-        if let Ok(old) = s.trim().parse::<i32>() {
-            if old != std::process::id() as i32 && pid_alive(old) {
-                unsafe { libc::kill(old, libc::SIGTERM); }
-                eprintln!("[doorbell] replaced stale watcher pid {}", old);
-            }
-        }
-    }
-    let _ = fs::write(&lock, std::process::id().to_string());
-
-    let read_flag = || fs::read_to_string(&flag).ok()
-        .and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0);
-
-    // --once / "check": kill duplicates + emit if there's unread, then exit (for the
-    // SessionStart hook — re-establishes the lock and pings once if mail is waiting)
+    // startup checks must not displace the persistent watcher
     if once {
-        if read_flag() > 0 {
-            println!("BUS: new mail for {}/{} — call agent-bus poll()", team, alias);
-        }
+        if read_flag_count(&flag) > 0 { ring_doorbell(&team, &alias); }
         return;
     }
 
-    // long-running watch. init from current state so a pre-drained flag doesn't fire.
-    let mut last = read_flag();
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(2000));
-        // if another watcher took the lock, we lost the race — exit quietly
-        if fs::read_to_string(&lock).ok().and_then(|s| s.trim().parse::<i32>().ok())
-            != Some(std::process::id() as i32) { return; }
-        let cur = read_flag();
-        // fire only when unread INCREASED (a genuinely new inbound message)
-        if cur > last {
-            println!("BUS: new mail for {}/{} — call agent-bus poll()", team, alias);
-        }
-        last = cur;
-    }
+    let lock = lock_path(&team, &alias);
+    watch_doorbell(
+        &flag,
+        &lock,
+        std::process::id() as i32,
+        std::time::Duration::from_millis(2000),
+        || ring_doorbell(&team, &alias),
+    );
 }
 
 fn cli_sync(flags: &HashMap<String, String>) {
@@ -2091,13 +2126,10 @@ fn repo_hook_command(team: &str, alias: &str) -> String {
     )
 }
 
-fn is_repo_bus_hook(command: &str, team: &str, alias: &str) -> bool {
-    let managed = command.contains("agent-bus poll")
+fn is_repo_bus_hook(command: &str) -> bool {
+    command.contains("agent-bus poll")
         || command.contains("agent-bus doctor")
-        || command.contains("agent-bus doorbell");
-    managed
-        && command.contains(&format!("--team {}", team))
-        && command.contains(&format!("--as {}", alias))
+        || command.contains("agent-bus doorbell")
 }
 
 fn wire_session_hook(repo: &str, team: &str, alias: &str) {
@@ -2118,7 +2150,7 @@ fn wire_session_hook(repo: &str, team: &str, alias: &str) {
         if let Some(hooks) = entry["hooks"].as_array_mut() {
             hooks.retain(|hook| {
                 !hook["command"].as_str()
-                    .map(|cmd| is_repo_bus_hook(cmd, team, alias))
+                    .map(is_repo_bus_hook)
                     .unwrap_or(false)
             });
             if hooks.is_empty() { continue; }
@@ -2306,9 +2338,6 @@ fn parse_args(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
     (m, pos)
 }
 
-#[cfg(test)]
-fn parse_flags(args: &[String]) -> HashMap<String, String> { parse_args(args).0 }
-
 // reject typo'd flags and stray arguments rather than acting on a wrong target
 fn guard(cmd: &str, flags: &HashMap<String, String>, pos: &[String], allowed: &[&str], max_pos: usize) {
     for k in flags.keys() {
@@ -2473,10 +2502,12 @@ mod tests {
         let c = mem();
         let r = tool_send(&c, "astrub", "sync", &json!({"to":"classic","type":"task","body":"execute Phase 7"})).unwrap();
         assert!(r["ok"].as_bool().unwrap());
+        assert_eq!(r["from"].as_str().unwrap(), "astrub/sync");
         assert_eq!(r["to"].as_str().unwrap(), "astrub/classic");
         let task_id = r["task_id"].as_str().unwrap().to_string();
 
         let r = tool_poll(&c, "astrub", "classic").unwrap();
+        assert_eq!(r["identity"].as_str().unwrap(), "astrub/classic");
         assert_eq!(r["count"].as_i64().unwrap(), 1);
         assert_eq!(r["messages"][0]["task_id"].as_str().unwrap(), task_id);
         assert_eq!(r["messages"][0]["from"].as_str().unwrap(), "astrub/sync");
@@ -2747,6 +2778,28 @@ mod tests {
     }
 
     #[test]
+    fn send_warns_when_alias_exists_in_multiple_teams() {
+        let c = mem();
+        tool_register(&c, "home-infra", "infra-home", &json!({})).unwrap();
+        tool_register(&c, "sergen", "infra-home", &json!({})).unwrap();
+        tool_register(&c, "sergen", "westepcloud.com", &json!({})).unwrap();
+
+        let r = tool_send(
+            &c,
+            "sergen",
+            "westepcloud.com",
+            &json!({"to":"infra-home","body":"check"}),
+        ).unwrap();
+        assert_eq!(r["from"], "sergen/westepcloud.com");
+        assert_eq!(r["to"], "sergen/infra-home");
+        assert_eq!(
+            r["identity_variants"],
+            json!(["home-infra/infra-home", "sergen/infra-home"]),
+        );
+        assert!(r["warning"].as_str().unwrap().contains("multiple teams"));
+    }
+
+    #[test]
     fn late_joining_agent_receives_earlier_mail() {
         // the dynamic-join case: mail sent before an agent registers is still delivered,
         // because poll matches on recipient and a new cursor starts at 0
@@ -2800,6 +2853,100 @@ mod tests {
         tool_poll(&c, "flagtest", "rcv").unwrap();     // drain
         assert_eq!(fs::read_to_string(&flag).unwrap().trim(), "0"); // refreshed, not deleted
         let _ = fs::remove_file(&flag);
+    }
+
+    #[test]
+    fn doorbell_once_does_not_replace_persistent_watcher() {
+        let _ = mem();
+        let team = format!("once-{}", short_id());
+        let alias = "receiver";
+        let flag = flag_path(&team, alias);
+        let lock = lock_path(&team, alias);
+        std::fs::create_dir_all(flag.parent().unwrap()).unwrap();
+        std::fs::write(&flag, "1").unwrap();
+        std::fs::write(&lock, "424242").unwrap();
+
+        let mut flags = HashMap::new();
+        flags.insert("team".to_string(), team);
+        flags.insert("as".to_string(), alias.to_string());
+        flags.insert("once".to_string(), "true".to_string());
+        cli_doorbell(&flags, &[]);
+
+        assert_eq!(watcher_pid(&lock), Some(424242));
+        std::fs::remove_file(flag).ok();
+        std::fs::remove_file(lock).ok();
+    }
+
+    #[test]
+    fn persistent_watcher_rings_pending_mail_at_start() {
+        let dir = std::env::temp_dir().join(format!("ab-pending-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let flag = dir.join("receiver.flag");
+        let lock = dir.join("receiver.watcher.pid");
+        std::fs::write(&flag, "2").unwrap();
+        let mut rings = 0;
+
+        watch_doorbell(
+            &flag,
+            &lock,
+            101,
+            std::time::Duration::from_millis(1),
+            || {
+                rings += 1;
+                std::fs::write(&lock, "202").unwrap();
+            },
+        );
+
+        assert_eq!(rings, 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn persistent_watcher_loses_lock_and_exits_normally() {
+        let dir = std::env::temp_dir().join(format!("ab-doorbell-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let flag = dir.join("receiver.flag");
+        let lock = dir.join("receiver.watcher.pid");
+        std::fs::write(&flag, "0").unwrap();
+
+        let old_flag = flag.clone();
+        let old_lock = lock.clone();
+        let old = std::thread::spawn(move || {
+            watch_doorbell(
+                &old_flag,
+                &old_lock,
+                101,
+                std::time::Duration::from_millis(5),
+                || {},
+            );
+        });
+        for _ in 0..100 {
+            if watcher_pid(&lock) == Some(101) { break; }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(watcher_pid(&lock), Some(101));
+
+        let new_flag = flag.clone();
+        let new_lock = lock.clone();
+        let new = std::thread::spawn(move || {
+            watch_doorbell(
+                &new_flag,
+                &new_lock,
+                202,
+                std::time::Duration::from_millis(5),
+                || {},
+            );
+        });
+        for _ in 0..100 {
+            if watcher_pid(&lock) == Some(202) { break; }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(watcher_pid(&lock), Some(202));
+        old.join().unwrap();
+
+        std::fs::write(&lock, "303").unwrap();
+        new.join().unwrap();
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -2968,8 +3115,9 @@ mod tests {
         std::fs::write(&path, r#"{
             "hooks":{"SessionStart":[
                 {"hooks":[{"type":"command","command":"bash other.sh"}]},
-                {"hooks":[{"type":"command","command":"agent-bus poll --team sergen --as site"}]},
-                {"hooks":[{"type":"command","command":"agent-bus doctor --team sergen --as site --quiet; agent-bus poll --team sergen --as site; agent-bus doorbell --team sergen --as site --once"}]}
+                {"hooks":[{"type":"command","command":"agent-bus poll --team home-infra --as infra-home"}]},
+                {"hooks":[{"type":"command","command":"agent-bus poll --team home-infra --as infra-repo"}]},
+                {"hooks":[{"type":"command","command":"agent-bus doctor --team sergen --as infra-home --quiet; agent-bus poll --team sergen --as infra-home; agent-bus doorbell --team sergen --as infra-home --once"}]}
             ]},
             "model":"x"
         }"#).unwrap();

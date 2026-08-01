@@ -90,8 +90,8 @@ server silently falls back to a parent-scope identity and the session mis-regist
 | Tool | Purpose |
 |------|---------|
 | `register(card?)` | register/refresh THIS agent (team+alias) + optional Agent Card |
-| `send(to, body, type?, state?, task_id?)` | see addressing below; `type:"task"` for work requests |
-| `poll()` | fetch new messages for me / my team / global since last poll; advance cursor |
+| `send(to, body, type?, state?, task_id?)` | see addressing below; warns when an alias exists in several teams |
+| `poll()` | fetch new messages and advance the cursor; returns the active `team/alias` identity |
 | `peers(team?)` | the roster: my team (default), a named team, or everyone (`team:"*"`) |
 
 ### Addressing (`send` `to`)
@@ -116,8 +116,10 @@ The installer's `CLAUDE.local.md` block arms this automatically; manually it's:
 ```
 Monitor(persistent:true, timeout_ms:3600000, command: agent-bus doorbell --team astrub --as sync)
 ```
-The SessionStart hook runs `doorbell --once` but never polls. The interactive MCP poll is
-what advances the cursor and writes receipts.
+The SessionStart hook runs `doorbell --once` but never polls. That check doesn't replace a
+persistent watcher. A new persistent watcher takes ownership without SIGTERM, so the old
+one exits normally on its next tick. Pending mail rings once when a watcher starts. The
+interactive MCP poll advances the cursor and writes receipts.
 
 Codex/Copilot: no background watcher. Call `poll()` at the start of each turn, or run
 `agent-bus doorbell --team <team> --as <alias>` in a terminal.
