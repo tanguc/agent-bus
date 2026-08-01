@@ -531,6 +531,16 @@ fn discover_identity(cwd: &Path) -> Option<(String, String)> {
     identity_from_settings(cwd).or_else(|| identity_from_bootstrap(cwd))
 }
 
+fn session_hook_polls(path: &Path) -> bool {
+    let Ok(s) = fs::read_to_string(path) else { return false };
+    let Ok(v) = serde_json::from_str::<Value>(&s) else { return false };
+    v["hooks"]["SessionStart"].as_array().map(|entries| entries.iter().any(|entry| {
+        entry["hooks"].as_array().map(|hooks| hooks.iter().any(|hook| {
+            hook["command"].as_str().map(|cmd| cmd.contains("agent-bus poll")).unwrap_or(false)
+        })).unwrap_or(false)
+    })).unwrap_or(false)
+}
+
 // is this dir actually an agent-bus repo? judged by real config (an agent-bus
 // .mcp.json entry, or a recoverable identity), NOT a stray "agent-bus" substring —
 // so a global `doctor --quiet` stays silent in unrelated projects (e.g. a home dir
@@ -1569,6 +1579,22 @@ fn cli_doctor(flags: &HashMap<String, String>) {
         "note":   if approved { "" } else { "run 'agent-bus install' to auto-approve" }
     }));
 
+    // shell-hook polling writes receipts before the interactive agent handles the mail
+    if session_hook_polls(&settings) {
+        if flags.contains_key("repair") {
+            if let Some((et, ea)) = expected.as_ref() {
+                wire_session_hook(&cwd.to_string_lossy(), et, ea);
+                checks.push(json!({"check":"session_hook","status":"warn",
+                    "note":"removed startup polling; backlog now drains through the interactive MCP poll"}));
+            }
+        } else {
+            checks.push(json!({"check":"session_hook","status":"warn",
+                "note":"SessionStart polls and marks mail read before the agent acts — run 'agent-bus doctor --repair'"}));
+        }
+    } else if expected.is_some() {
+        checks.push(json!({"check":"session_hook","status":"ok"}));
+    }
+
     // 4b. agent-bus artifacts must stay local — never pushed to a remote
     let mut leaks: Vec<String> = vec![];
     for art in ["CLAUDE.local.md", ".mcp.json"] {
@@ -2057,6 +2083,23 @@ fn upsert_block(existing: &str, block: &str) -> String {
     }
 }
 
+fn repo_hook_command(team: &str, alias: &str) -> String {
+    // hook output is ambient context; polling here marks mail read before the agent acts
+    format!(
+        "agent-bus doctor --team {t} --as {a} --quiet; agent-bus doorbell --team {t} --as {a} --once",
+        t = team, a = alias
+    )
+}
+
+fn is_repo_bus_hook(command: &str, team: &str, alias: &str) -> bool {
+    let managed = command.contains("agent-bus poll")
+        || command.contains("agent-bus doctor")
+        || command.contains("agent-bus doorbell");
+    managed
+        && command.contains(&format!("--team {}", team))
+        && command.contains(&format!("--as {}", alias))
+}
+
 fn wire_session_hook(repo: &str, team: &str, alias: &str) {
     let dir  = PathBuf::from(repo).join(".claude");
     fs::create_dir_all(&dir).ok();
@@ -2067,37 +2110,29 @@ fn wire_session_hook(repo: &str, team: &str, alias: &str) {
         json!({})
     };
     if !root.is_object() { root = json!({}); }
+    if !root["hooks"].is_object() { root["hooks"] = json!({}); }
 
-    // doctor --quiet first: it surfaces config/identity drift (e.g. a missing
-    // .mcp.json making the session fall back to a parent identity) in the session's
-    // startup context, before poll runs. --team/--as pin the *expected* identity.
-    // doctor (config drift) → poll (drain backlog) → doorbell --once (kill any stale
-    // watcher from a dead session, ping if mail is already waiting). The long-running
-    // watcher itself is armed by the Monitor in the CLAUDE.local.md bootstrap.
-    let hook_cmd = format!(
-        "agent-bus doctor --team {t} --as {a} --quiet; agent-bus poll --team {t} --as {a}; agent-bus doorbell --team {t} --as {a} --once",
-        t = team, a = alias
-    );
+    let hook_cmd = repo_hook_command(team, alias);
+    let mut starts = Vec::new();
+    for mut entry in root["hooks"]["SessionStart"].as_array().cloned().unwrap_or_default() {
+        if let Some(hooks) = entry["hooks"].as_array_mut() {
+            hooks.retain(|hook| {
+                !hook["command"].as_str()
+                    .map(|cmd| is_repo_bus_hook(cmd, team, alias))
+                    .unwrap_or(false)
+            });
+            if hooks.is_empty() { continue; }
+        }
+        starts.push(entry);
+    }
+    starts.push(json!({"hooks": [{"type": "command", "command": hook_cmd}]}));
 
-    // check if our hook already exists
-    let already = root["hooks"]["SessionStart"]
-        .as_array()
-        .map(|arr| arr.iter().any(|entry| {
-            entry["hooks"].as_array().map(|h| h.iter().any(|hk| {
-                hk["command"].as_str() == Some(&hook_cmd)
-            })).unwrap_or(false)
-        }))
-        .unwrap_or(false);
-
-    if already {
+    let next = json!(starts);
+    if root["hooks"]["SessionStart"] == next {
         println!("• SessionStart hook already present in {}", path.display());
         return;
     }
-
-    if !root["hooks"].is_object() { root["hooks"] = json!({}); }
-    let mut starts = root["hooks"]["SessionStart"].as_array().cloned().unwrap_or_default();
-    starts.push(json!({"hooks": [{"type": "command", "command": hook_cmd}]}));
-    root["hooks"]["SessionStart"] = json!(starts);
+    root["hooks"]["SessionStart"] = next;
 
     fs::write(&path, serde_json::to_string_pretty(&root).unwrap() + "\n").ok();
     println!("wired SessionStart hook in {}", path.display());
@@ -2229,8 +2264,8 @@ This repo has the `agent-bus` MCP server, identity `{team}/{alias}`. At session 
 ```\n\
 Monitor(persistent:true, timeout_ms:3600000, command: agent-bus doorbell --team {team} --as {alias})\n\
 ```\n\
-   The SessionStart hook also runs `agent-bus doorbell --once` to ping you if mail\n\
-   arrived while you were away, and to kill any stale watcher from a dead session.\n\
+   The SessionStart hook runs doctor + `doorbell --once`, but never polls or marks\n\
+   mail read. It pings if mail arrived while you were away and clears stale watchers.\n\
 4. On a `BUS:` ping, call `mcp__agent-bus__poll` and act on the messages.\n\
 5. Reply with `mcp__agent-bus__send` — to=\"alias\" (same team), \"team/alias\" (cross-team), or \"team:{team}\" (broadcast).\n\
 6. `mcp__agent-bus__peers` lists your team roster (team:\"*\" = everyone).\n\
@@ -2922,6 +2957,40 @@ mod tests {
             .filter_map(|h| h["command"].as_str()).collect();
         assert!(cmds.iter().any(|c| c.contains("bash other.sh")));
         assert!(cmds.iter().any(|c| c.contains("agent-bus doctor --quiet")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wire_session_hook_removes_polling_duplicates() {
+        let dir = std::env::temp_dir().join(format!("ab-sh-{}", short_id()));
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        let path = dir.join(".claude/settings.local.json");
+        std::fs::write(&path, r#"{
+            "hooks":{"SessionStart":[
+                {"hooks":[{"type":"command","command":"bash other.sh"}]},
+                {"hooks":[{"type":"command","command":"agent-bus poll --team sergen --as site"}]},
+                {"hooks":[{"type":"command","command":"agent-bus doctor --team sergen --as site --quiet; agent-bus poll --team sergen --as site; agent-bus doorbell --team sergen --as site --once"}]}
+            ]},
+            "model":"x"
+        }"#).unwrap();
+        assert!(session_hook_polls(&path));
+
+        wire_session_hook(&dir.to_string_lossy(), "sergen", "site");
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert!(!session_hook_polls(&path));
+        let v: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(v["model"], "x");
+        let cmds: Vec<&str> = v["hooks"]["SessionStart"].as_array().unwrap().iter()
+            .flat_map(|e| e["hooks"].as_array().unwrap())
+            .filter_map(|h| h["command"].as_str())
+            .collect();
+        assert_eq!(cmds.len(), 2);
+        assert!(cmds.contains(&"bash other.sh"));
+        assert!(cmds.contains(&repo_hook_command("sergen", "site").as_str()));
+        assert!(!cmds.iter().any(|c| c.contains("agent-bus poll")));
+
+        wire_session_hook(&dir.to_string_lossy(), "sergen", "site");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
         std::fs::remove_dir_all(&dir).ok();
     }
 

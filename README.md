@@ -61,9 +61,11 @@ set `"enableAllProjectMcpServers": true` in `~/.claude/settings.json`.
 server silently falls back to a parent-scope identity and the session mis-registers.
 
 - The per-repo installer wires a `SessionStart` hook that runs `agent-bus doctor --quiet`
-  before `poll`, so drift surfaces in the session's startup context. `doctor` recovers the
-  **expected** identity from the hook flags or the `CLAUDE.local.md` bootstrap and warns when
-  the local `.mcp.json` is missing or points elsewhere.
+  and `agent-bus doorbell --once`. It does not poll: startup-hook output is ambient context,
+  so polling there could mark mail read before the agent handles it. The bootstrap's MCP
+  `poll` call drains the backlog in the interactive turn. `doctor` recovers the **expected**
+  identity from the hook flags or `CLAUDE.local.md` and warns when `.mcp.json` is missing or
+  points elsewhere.
 - `agent-bus doctor --repair` recreates a missing/mismatched `.mcp.json` from the expected
   identity (explicit — it never auto-reverts an intentional re-team).
 - `agent-bus install-hook` adds a **global** `SessionStart` hook to `~/.claude/settings.json`
@@ -110,16 +112,15 @@ own team on the same bus with no cross-chatter unless explicitly addressed. Mirr
 astrub cockpit-group / party philosophy, one layer up (agents instead of game accounts).
 
 ## Wake (doorbell) — Claude Code
-The installer's CLAUDE.local.md block arms this automatically; manually it's:
+The installer's `CLAUDE.local.md` block arms this automatically; manually it's:
 ```
-Monitor(persistent:true, timeout_ms:3600000, command: |
-  f=~/.agent-bus/inbox/astrub/sync.flag; last=""; while true; do
-    if [ -f "$f" ]; then m=$(stat -f %m "$f" 2>/dev/null);
-      if [ "$m" != "$last" ]; then echo "BUS: new mail for astrub/sync — call agent-bus poll()"; last="$m"; fi; fi;
-    sleep 2; done)
+Monitor(persistent:true, timeout_ms:3600000, command: agent-bus doorbell --team astrub --as sync)
 ```
-Codex/Copilot: no background watcher — call `poll()` at the start of each turn, or run
-`fswatch ~/.agent-bus/inbox/<team>/<alias>.flag` in a terminal.
+The SessionStart hook runs `doorbell --once` but never polls. The interactive MCP poll is
+what advances the cursor and writes receipts.
+
+Codex/Copilot: no background watcher. Call `poll()` at the start of each turn, or run
+`agent-bus doorbell --team <team> --as <alias>` in a terminal.
 
 ## Config / state
 - `AGENT_BUS_TEAM` — logical group (default `default`).
