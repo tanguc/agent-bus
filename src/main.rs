@@ -155,18 +155,29 @@ fn resolve_to(to: &str, my_team: &str) -> (String, String) {
     }
 }
 
-// actionable unread for a peer: messages addressed to it, minus its own sends,
-// that it has not yet received a receipt for. This is the same notion poll() drains,
-// so the flag reflects "real inbound mail" — not receipts or self-echo.
+// actionable unread for a peer: exactly the rows poll() would return next — messages
+// past the peer's cursor, addressed to it, minus its own broadcast echo. It MUST mirror
+// poll's WHERE clause and watermark; a receipt-based count diverges permanently once the
+// cursor advances past a message that never got a receipt, so the flag sticks positive
+// and the doorbell rings on mail poll() can no longer deliver.
 fn unread_count(conn: &Connection, team: &str, alias: &str) -> i64 {
+    let last: i64 = conn
+        .query_row(
+            "SELECT last_id FROM cursors WHERE team=?1 AND alias=?2",
+            params![team, alias],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or(0);
     conn.query_row(
-        "SELECT COUNT(*) FROM messages m \
-         WHERE ((m.recipient_team=?1 AND (m.recipient_alias=?2 OR m.recipient_alias='*')) \
-                OR (m.recipient_team='*' AND m.recipient_alias='*')) \
-         AND NOT (m.sender_team=?1 AND m.sender_alias=?2) \
-         AND NOT EXISTS (SELECT 1 FROM receipts r \
-             WHERE r.message_id=m.id AND r.reader_team=?1 AND r.reader_alias=?2)",
-        params![team, alias],
+        "SELECT COUNT(*) FROM messages WHERE id > ?3 AND ( \
+           (recipient_team=?1 AND recipient_alias=?2) \
+           OR (recipient_alias='*' AND (recipient_team=?1 OR recipient_team='*') \
+               AND NOT (sender_team=?1 AND sender_alias=?2)) \
+         )",
+        params![team, alias, last],
         |r| r.get(0),
     ).unwrap_or(0)
 }
@@ -744,21 +755,8 @@ fn tool_peers(conn: &Connection, my_team: &str, args: &Value) -> rusqlite::Resul
                 "last_seen": ls,
             });
             if show_unread {
-                // messages addressed to this peer with no receipt yet
-                let unread: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM messages m \
-                         WHERE ((m.recipient_team=?1 AND (m.recipient_alias=?2 OR m.recipient_alias='*')) \
-                                OR (m.recipient_team='*' AND m.recipient_alias='*')) \
-                         AND NOT (m.sender_team=?1 AND m.sender_alias=?2) \
-                         AND NOT EXISTS (\
-                           SELECT 1 FROM receipts r \
-                           WHERE r.message_id=m.id AND r.reader_team=?1 AND r.reader_alias=?2)",
-                        params![t, a],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
-                obj["unread"] = json!(unread);
+                // mirror the flag/poll watermark, not receipts (see unread_count)
+                obj["unread"] = json!(unread_count(conn, &t, &a));
             }
             obj
         })
@@ -2882,9 +2880,47 @@ mod tests {
         tool_send(&c, "astrub", "classic", &json!({"to":"team:astrub","body":"broadcast"})).unwrap();
         assert_eq!(unread_count(&c, "astrub", "classic"), 1);
 
-        // a receipt (classic reads via poll) drops it back to 0 — the flag would too
+        // classic reads via poll -> cursor advances past it, unread drops to 0
         tool_poll(&c, "astrub", "classic").unwrap();
         assert_eq!(unread_count(&c, "astrub", "classic"), 0);
+    }
+
+    #[test]
+    fn unread_follows_cursor_not_receipts() {
+        // regression: a message below the cursor with no receipt must NOT count as
+        // unread. poll() can never redeliver it (id <= last_id), so a receipt-based
+        // count would stick positive forever and ring the doorbell on undrainable mail.
+        let c = mem();
+        tool_register(&c, "astrub", "client", &json!({})).unwrap();
+        tool_register(&c, "astrub", "classic", &json!({})).unwrap();
+
+        // a real early message classic never receipted
+        tool_send(&c, "astrub", "classic", &json!({"to":"client","body":"old"})).unwrap();
+        assert_eq!(unread_count(&c, "astrub", "client"), 1);
+
+        // force the cursor past it without writing a receipt (models the divergence
+        // that stranded ids 3-32 below client's 5674 cursor on the live bus)
+        let last: i64 = c.query_row("SELECT MAX(id) FROM messages", [], |r| r.get(0)).unwrap();
+        c.execute(
+            "INSERT INTO cursors(team, alias, last_id) VALUES('astrub','client',?1) \
+             ON CONFLICT(team, alias) DO UPDATE SET last_id=?1",
+            params![last],
+        ).unwrap();
+
+        // no receipt exists, yet unread is 0 because poll can no longer reach it
+        let has_receipt: i64 = c.query_row(
+            "SELECT COUNT(*) FROM receipts WHERE reader_team='astrub' AND reader_alias='client'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(has_receipt, 0);
+        assert_eq!(unread_count(&c, "astrub", "client"), 0);
+        // the next flag refresh (poll/send) clears the stale positive
+        write_flag(&c, "astrub", "client");
+        assert_eq!(fs::read_to_string(flag_path("astrub", "client")).unwrap().trim(), "0");
+
+        // a fresh message past the cursor still counts
+        tool_send(&c, "astrub", "classic", &json!({"to":"client","body":"new"})).unwrap();
+        assert_eq!(unread_count(&c, "astrub", "client"), 1);
+        let _ = fs::remove_file(flag_path("astrub", "client"));
     }
 
     #[test]
