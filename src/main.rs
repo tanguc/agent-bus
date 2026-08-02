@@ -561,6 +561,19 @@ fn session_hook_polls(path: &Path) -> bool {
     })).unwrap_or(false)
 }
 
+fn session_hook_is_canonical(path: &Path, team: &str, alias: &str) -> bool {
+    let Ok(s) = fs::read_to_string(path) else { return false };
+    let Ok(v) = serde_json::from_str::<Value>(&s) else { return false };
+    let expected = repo_hook_command(team, alias);
+    let commands: Vec<&str> = v["hooks"]["SessionStart"].as_array().into_iter()
+        .flatten()
+        .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+        .filter_map(|hook| hook["command"].as_str())
+        .filter(|command| is_repo_bus_hook(command))
+        .collect();
+    commands.len() == 1 && commands[0] == expected
+}
+
 // is this dir actually an agent-bus repo? judged by real config (an agent-bus
 // .mcp.json entry, or a recoverable identity), NOT a stray "agent-bus" substring —
 // so a global `doctor --quiet` stays silent in unrelated projects (e.g. a home dir
@@ -1572,10 +1585,11 @@ fn cli_doctor(flags: &HashMap<String, String>) {
     // --team/--as. If the local .mcp.json is missing or pins a different identity,
     // the MCP server silently falls back to a parent-scope config (this is exactly
     // how a session mis-registered as the parent identity after .mcp.json vanished).
-    // expected identity: explicit flags win, else recovered from durable per-repo
-    // evidence (so a bare `doctor --quiet` from the global hook still detects drift)
+    // expected identity: explicit flags win, then durable per-repo evidence. A local
+    // MCP identity can rebuild missing hooks and bootstrap files when no other copy remains.
     let expected = flags.get("team").cloned().zip(flags.get("as").cloned())
-        .or_else(|| discover_identity(&cwd));
+        .or_else(|| discover_identity(&cwd))
+        .or_else(|| mcp_identity(&mcp));
     if let Some((et, ea)) = expected.as_ref() {
         let actual = mcp_identity(&mcp);
         let matches = actual.as_ref().map(|(t, a)| t == et && a == ea).unwrap_or(false);
@@ -1615,19 +1629,43 @@ fn cli_doctor(flags: &HashMap<String, String>) {
     }));
 
     // shell-hook polling writes receipts before the interactive agent handles the mail
-    if session_hook_polls(&settings) {
-        if flags.contains_key("repair") {
-            if let Some((et, ea)) = expected.as_ref() {
-                wire_session_hook(&cwd.to_string_lossy(), et, ea);
-                checks.push(json!({"check":"session_hook","status":"warn",
-                    "note":"removed startup polling; backlog now drains through the interactive MCP poll"}));
+    if let Some((et, ea)) = expected.as_ref() {
+        if session_hook_is_canonical(&settings, et, ea) {
+            checks.push(json!({"check":"session_hook","status":"ok"}));
+        } else if flags.contains_key("repair") {
+            let had_poll = session_hook_polls(&settings);
+            wire_session_hook(&cwd.to_string_lossy(), et, ea);
+            checks.push(json!({"check":"session_hook","status":"warn",
+                "note":if had_poll {
+                    "removed startup polling; backlog now drains through the interactive MCP poll"
+                } else {
+                    "installed the canonical SessionStart doctor + doorbell check"
+                }}));
+        } else {
+            let note = if session_hook_polls(&settings) {
+                "SessionStart polls and marks mail read before the agent acts — run 'agent-bus doctor --repair'"
+            } else {
+                "SessionStart hook is missing or stale — run 'agent-bus doctor --repair'"
+            };
+            checks.push(json!({"check":"session_hook","status":"warn","note":note}));
+        }
+
+        if bootstrap_is_canonical(&cwd, et, ea) {
+            checks.push(json!({"check":"bootstrap","status":"ok"}));
+        } else if flags.contains_key("repair") {
+            match refresh_bootstrap(&cwd, et, ea) {
+                Ok(_) => checks.push(json!({"check":"bootstrap","status":"warn",
+                    "note":"updated CLAUDE.local.md with the native doorbell workflow"})),
+                Err(e) => {
+                    all_ok = false;
+                    checks.push(json!({"check":"bootstrap","status":"fail",
+                        "note":format!("could not update CLAUDE.local.md: {}", e)}));
+                }
             }
         } else {
-            checks.push(json!({"check":"session_hook","status":"warn",
-                "note":"SessionStart polls and marks mail read before the agent acts — run 'agent-bus doctor --repair'"}));
+            checks.push(json!({"check":"bootstrap","status":"warn",
+                "note":"CLAUDE.local.md is missing or stale — run 'agent-bus doctor --repair'"}));
         }
-    } else if expected.is_some() {
-        checks.push(json!({"check":"session_hook","status":"ok"}));
     }
 
     // 4b. agent-bus artifacts must stay local — never pushed to a remote
@@ -2118,6 +2156,21 @@ fn upsert_block(existing: &str, block: &str) -> String {
     }
 }
 
+fn refresh_bootstrap(repo: &Path, team: &str, alias: &str) -> std::io::Result<bool> {
+    let path = repo.join("CLAUDE.local.md");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let next = upsert_block(&existing, &bootstrap_block(team, alias));
+    if next == existing { return Ok(false); }
+    fs::write(path, next)?;
+    Ok(true)
+}
+
+fn bootstrap_is_canonical(repo: &Path, team: &str, alias: &str) -> bool {
+    let path = repo.join("CLAUDE.local.md");
+    let Ok(existing) = fs::read_to_string(path) else { return false };
+    upsert_block(&existing, &bootstrap_block(team, alias)) == existing
+}
+
 fn repo_hook_command(team: &str, alias: &str) -> String {
     // hook output is ambient context; polling here marks mail read before the agent acts
     format!(
@@ -2224,9 +2277,7 @@ fn install_claude(repo: &str, team: &str, alias: &str, exe: &str) {
     // the bootstrap hardcodes machine-specific inbox paths, so it belongs in
     // CLAUDE.local.md — loaded right after CLAUDE.md, and never committed
     let local = PathBuf::from(repo).join("CLAUDE.local.md");
-    let existing = fs::read_to_string(&local).unwrap_or_default();
-    fs::write(&local, upsert_block(&existing, &bootstrap_block(team, alias)))
-        .expect("write CLAUDE.local.md");
+    refresh_bootstrap(Path::new(repo), team, alias).expect("write CLAUDE.local.md");
     println!("wrote agent-bus bootstrap into {}", local.display());
 
     migrate_legacy_block(Path::new(repo));
@@ -2297,7 +2348,7 @@ This repo has the `agent-bus` MCP server, identity `{team}/{alias}`. At session 
 Monitor(persistent:true, timeout_ms:3600000, command: agent-bus doorbell --team {team} --as {alias})\n\
 ```\n\
    The SessionStart hook runs doctor + `doorbell --once`, but never polls or marks\n\
-   mail read. It pings if mail arrived while you were away and clears stale watchers.\n\
+   mail read. It checks pending mail without replacing the persistent watcher.\n\
 4. On a `BUS:` ping, call `mcp__agent-bus__poll` and act on the messages.\n\
 5. Reply with `mcp__agent-bus__send` — to=\"alias\" (same team), \"team/alias\" (cross-team), or \"team:{team}\" (broadcast).\n\
 6. `mcp__agent-bus__peers` lists your team roster (team:\"*\" = everyone).\n\
@@ -3138,6 +3189,63 @@ mod tests {
         assert!(!cmds.iter().any(|c| c.contains("agent-bus poll")));
 
         wire_session_hook(&dir.to_string_lossy(), "sergen", "site");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+        assert!(session_hook_is_canonical(&path, "sergen", "site"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wire_session_hook_installs_missing_and_replaces_stale_native_hook() {
+        let dir = std::env::temp_dir().join(format!("ab-sh-repair-{}", short_id()));
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        let path = dir.join(".claude/settings.local.json");
+
+        assert!(!session_hook_is_canonical(&path, "astrub", "client"));
+        wire_session_hook(&dir.to_string_lossy(), "astrub", "client");
+        assert!(session_hook_is_canonical(&path, "astrub", "client"));
+        let installed = std::fs::read_to_string(&path).unwrap();
+        wire_session_hook(&dir.to_string_lossy(), "astrub", "client");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), installed);
+
+        std::fs::write(&path, r#"{
+            "hooks":{"SessionStart":[
+                {"hooks":[{"type":"command","command":"bash other.sh"}]},
+                {"hooks":[{"type":"command","command":"agent-bus doctor --team old --as client --quiet; agent-bus doorbell --team old --as client --once"}]}
+            ]}
+        }"#).unwrap();
+        assert!(!session_hook_polls(&path));
+        assert!(!session_hook_is_canonical(&path, "astrub", "client"));
+
+        wire_session_hook(&dir.to_string_lossy(), "astrub", "client");
+        assert!(session_hook_is_canonical(&path, "astrub", "client"));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let commands: Vec<&str> = v["hooks"]["SessionStart"].as_array().unwrap().iter()
+            .flat_map(|entry| entry["hooks"].as_array().unwrap())
+            .filter_map(|hook| hook["command"].as_str())
+            .collect();
+        assert!(commands.contains(&"bash other.sh"));
+        assert!(!commands.iter().any(|command| command.contains("--team old")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn refresh_bootstrap_replaces_stale_watcher_and_preserves_notes() {
+        let dir = std::env::temp_dir().join(format!("ab-bootstrap-repair-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("CLAUDE.local.md");
+        std::fs::write(&path, format!(
+            "local notes\n\n{}\nMonitor(command: while true; do stat client.flag; sleep 2; done)\n{}\n",
+            BLOCK_START, BLOCK_END
+        )).unwrap();
+
+        assert!(!bootstrap_is_canonical(&dir, "astrub", "client"));
+        assert!(refresh_bootstrap(&dir, "astrub", "client").unwrap());
+        assert!(bootstrap_is_canonical(&dir, "astrub", "client"));
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert!(first.contains("local notes"));
+        assert!(first.contains("agent-bus doorbell --team astrub --as client"));
+        assert!(!first.contains("while true; do stat"));
+        assert!(!refresh_bootstrap(&dir, "astrub", "client").unwrap());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
         std::fs::remove_dir_all(&dir).ok();
     }

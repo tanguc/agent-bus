@@ -66,8 +66,9 @@ server silently falls back to a parent-scope identity and the session mis-regist
   `poll` call drains the backlog in the interactive turn. `doctor` recovers the **expected**
   identity from the hook flags or `CLAUDE.local.md` and warns when `.mcp.json` is missing or
   points elsewhere.
-- `agent-bus doctor --repair` recreates a missing/mismatched `.mcp.json` from the expected
-  identity (explicit — it never auto-reverts an intentional re-team).
+- `agent-bus doctor --repair` recreates a missing/mismatched `.mcp.json`, installs or
+  canonicalizes the per-repo SessionStart hook, and refreshes the managed
+  `CLAUDE.local.md` block. Content outside the managed block is preserved.
 - `agent-bus install-hook` adds a **global** `SessionStart` hook to `~/.claude/settings.json`
   (`agent-bus doctor --quiet`). It runs in every session — silent in non-agent-bus repos,
   drift-checking in agent-bus ones — so detection survives even a wiped per-repo `.claude/`.
