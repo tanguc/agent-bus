@@ -1224,15 +1224,47 @@ fn serve() {
 }
 
 // ---------------------------------------------------------------- CLI client
+// bare CLI (no --team/--as, no env) still has to find the repo's identity: MCP tools
+// get env from .mcp.json at spawn time, but `agent-bus whoami` / poll / send from a shell
+// do not. fall through to cwd evidence so a shell in the repo is not silently default/cli.
+fn cwd_identity() -> Option<(String, String)> {
+    let cwd = std::env::current_dir().ok()?;
+    mcp_identity(&cwd.join(".mcp.json")).or_else(|| discover_identity(&cwd))
+}
+
 fn cli_team(flags: &HashMap<String, String>) -> String {
-    flags.get("team").cloned().unwrap_or_else(team_env)
+    if let Some(t) = flags.get("team") { return t.clone(); }
+    if let Ok(t) = std::env::var("AGENT_BUS_TEAM") { return t; }
+    if let Some((t, _)) = cwd_identity() { return t; }
+    "default".into()
 }
 fn cli_alias(flags: &HashMap<String, String>) -> String {
-    flags
-        .get("as")
-        .or_else(|| flags.get("alias"))
-        .cloned()
-        .unwrap_or_else(|| std::env::var("AGENT_BUS_ALIAS").unwrap_or_else(|_| "cli".into()))
+    if let Some(a) = flags.get("as").or_else(|| flags.get("alias")) { return a.clone(); }
+    if let Ok(a) = std::env::var("AGENT_BUS_ALIAS") { return a; }
+    if let Some((_, a)) = cwd_identity() { return a; }
+    "cli".into()
+}
+
+fn cli_identity_sources(flags: &HashMap<String, String>) -> (&'static str, &'static str) {
+    let team_src = if flags.contains_key("team") {
+        "flag"
+    } else if std::env::var("AGENT_BUS_TEAM").is_ok() {
+        "env"
+    } else if cwd_identity().is_some() {
+        "cwd"
+    } else {
+        "default"
+    };
+    let alias_src = if flags.contains_key("as") || flags.contains_key("alias") {
+        "flag"
+    } else if std::env::var("AGENT_BUS_ALIAS").is_ok() {
+        "env"
+    } else if cwd_identity().is_some() {
+        "cwd"
+    } else {
+        "default"
+    };
+    (team_src, alias_src)
 }
 
 fn cli_send(flags: &HashMap<String, String>) {
@@ -1445,9 +1477,8 @@ fn watch_doorbell<F: FnMut()>(
 // one watcher owns each identity. takeover changes the lock owner; the old watcher sees
 // that on its next tick and exits 0 instead of turning normal replacement into exit 143
 fn cli_doorbell(flags: &HashMap<String, String>, pos: &[String]) {
-    let team  = flags.get("team").cloned().unwrap_or_else(team_env);
-    let alias = flags.get("as").cloned()
-        .unwrap_or_else(|| std::env::var("AGENT_BUS_ALIAS").unwrap_or_else(|_| "cli".into()));
+    let team  = cli_team(flags);
+    let alias = cli_alias(flags);
     let once  = flags.contains_key("once") || pos.first().map(|s| s == "check").unwrap_or(false);
 
     let flag = flag_path(&team, &alias);
@@ -1515,10 +1546,7 @@ fn cli_unregister(flags: &HashMap<String, String>, pos: &[String]) {
 fn cli_whoami(flags: &HashMap<String, String>) {
     let team  = cli_team(flags);
     let alias = cli_alias(flags);
-    let team_src  = if std::env::var("AGENT_BUS_TEAM").is_ok() { "env" } else { "default" };
-    let alias_src = if std::env::var("AGENT_BUS_ALIAS").is_ok() { "env" }
-                    else if flags.contains_key("as") || flags.contains_key("alias") { "flag" }
-                    else { "default" };
+    let (team_src, alias_src) = cli_identity_sources(flags);
     let v = json!({
         "ok":       true,
         "identity": format!("{}/{}", team, alias),
@@ -3147,6 +3175,24 @@ mod tests {
         assert!(!is_agentbus_repo(&dir3));
 
         std::fs::remove_dir_all(&dir).ok(); std::fs::remove_dir_all(&dir2).ok(); std::fs::remove_dir_all(&dir3).ok();
+    }
+
+    #[test]
+    fn cli_identity_falls_back_to_cwd_mcp_json() {
+        // bare shell has no --team/--as and no env; whoami/poll must pick up the repo's
+        // .mcp.json instead of silently becoming default/cli (myideas bug, 2026-08-16)
+        let dir = std::env::temp_dir().join(format!("ab-whoami-{}", short_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".mcp.json"),
+            r#"{"mcpServers":{"agent-bus":{"command":"agent-bus","args":["serve"],"env":{"AGENT_BUS_TEAM":"sergen","AGENT_BUS_ALIAS":"myideas"}}}}"#).unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let got = cwd_identity();
+        std::env::set_current_dir(prev).ok();
+
+        assert_eq!(got, Some(("sergen".into(), "myideas".into())));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
