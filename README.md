@@ -19,10 +19,32 @@ agent-bus send --to X --body Y [--type task] [--state s] [--task-id id] [--as al
 agent-bus poll [--as alias]
 agent-bus peers
 agent-bus register [--card ..] [--as alias]
+agent-bus guest [--card ..] [--as slug] [--ttl hours]   # ephemeral tmp/ mailbox
 ```
 
 Identity is `team/alias` — `AGENT_BUS_TEAM`+`AGENT_BUS_ALIAS` (server) or `--team`/`--as` (CLI):
 `astrub/sync`, `astrub/classic`, `astrub/client`, `webapp/api`, ...
+
+### Guest (ephemeral) identities
+Ad-hoc sessions without a project install (e.g. a Claude session in `/tmp`) can claim a
+short-lived mailbox under team `tmp`:
+
+```bash
+agent-bus guest --card "idea capture" --as cc-34
+# → tmp/cc-34, shell exports, doorbell command
+export AGENT_BUS_TEAM=tmp AGENT_BUS_ALIAS=cc-34
+agent-bus send --to sergen/myideas --body "..."
+agent-bus poll
+```
+
+Rules:
+- claim only from boot identity `default/cli`, `default/unknown`, or an existing `tmp/*`
+- durable boot identities (`sergen/myideas`, …) refuse guest rebind
+- guests may DM **registered durable** peers with full `team/alias` only
+- no broadcast, no guest→guest
+- MCP `guest` / `register({ephemeral:true})` rebinds the serve process identity on success
+- TTL default 4h; `prune --guests` / `sync --fix` drops expired guests
+
 
 ## Why this shape
 - **South side = MCP** — the one protocol every CLI agent already speaks as a client.
@@ -90,7 +112,8 @@ server silently falls back to a parent-scope identity and the session mis-regist
 ## Tools (MCP)
 | Tool | Purpose |
 |------|---------|
-| `register(card?)` | register/refresh THIS agent (team+alias) + optional Agent Card |
+| `register(card?, ephemeral?, as?, ttl?)` | register/refresh THIS agent; `ephemeral:true` claims a `tmp/` guest |
+| `guest(card?, as?, ttl?)` | claim ephemeral `tmp/<alias>`; rebinds MCP identity when boot is claimable |
 | `send(to, body, type?, state?, task_id?)` | see addressing below; warns when an alias exists in several teams |
 | `poll()` | fetch new messages and advance the cursor; returns the active `team/alias` identity |
 | `peers(team?)` | the roster: my team (default), a named team, or everyone (`team:"*"`) |

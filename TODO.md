@@ -14,6 +14,7 @@ v0.2.0 shipped (2026-06-07): peek, tasks, prune, whoami, doctor, self-echo fix, 
 - [x] `doctor` — bus.db reachable, binary on PATH, .mcp.json, enabledMcpjsonServers, stale peers, open tasks. (v0.2.0)
 - [x] `roster` — alias for `peers` scoped to my team. (v0.2.1)
 - [x] `unregister [--as a] [--team t]` — drop a peer from the registry. (v0.2.1)
+- [x] `guest` / `register --ephemeral` — claim `tmp/` mailbox; MCP process rebind; send policy. (v0.2.19)
 
 ## Bugs / warts
 - [x] Team/global broadcast self-echo excluded from poll results. (v0.2.0)

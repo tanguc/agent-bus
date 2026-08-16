@@ -12,10 +12,12 @@
 //   agent-bus whoami                    print identity + config source
 //   agent-bus doctor                    check bus health
 //   agent-bus register [--card ..]
+//   agent-bus guest [--card ..] [--as slug] [--ttl hours]
 //   agent-bus teams
 //   agent-bus version
 //
 // Identity = AGENT_BUS_TEAM/AGENT_BUS_ALIAS (MCP serve) or --team/--as (CLI).
+// Guests live under team `tmp` (ephemeral, TTL); claim only from default/unknown|cli.
 // A2A-shaped: task_id + lifecycle state (submitted→working→completed|failed).
 
 use inquire::{InquireError, Select, Text};
@@ -114,6 +116,196 @@ fn short_id() -> String {
 // ---------------------------------------------------------------- storage
 fn init_schema(conn: &Connection) {
     conn.execute_batch(SCHEMA).expect("init schema");
+    migrate_schema(conn);
+}
+
+// additive columns for guest identities; ignore if already present
+fn migrate_schema(conn: &Connection) {
+    let _ = conn.execute(
+        "ALTER TABLE peers ADD COLUMN ephemeral INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE peers ADD COLUMN expires_at INTEGER", []);
+}
+
+const GUEST_TEAM: &str = "tmp";
+const DEFAULT_GUEST_TTL_HOURS: i64 = 4;
+const MAX_GUEST_TTL_HOURS: i64 = 168; // 7d
+
+fn is_guest_team(team: &str) -> bool {
+    team == GUEST_TEAM
+}
+
+// boot identities allowed to mint a guest mailbox (no durable project identity)
+fn is_claimable_boot_identity(team: &str, alias: &str) -> bool {
+    if is_guest_team(team) {
+        return true; // already a guest — refresh / re-claim ok
+    }
+    matches!(
+        (team, alias),
+        ("default", "unknown") | ("default", "cli") | ("", _) | (_, "")
+    )
+}
+
+fn peer_is_ephemeral(conn: &Connection, team: &str, alias: &str) -> bool {
+    // only true for a row that exists; missing peers are not "ephemeral recipients"
+    conn.query_row(
+        "SELECT ephemeral FROM peers WHERE team=?1 AND alias=?2",
+        params![team, alias],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .map(|v| v != 0)
+    .unwrap_or(false)
+}
+
+fn sanitize_guest_alias(raw: &str) -> String {
+    let s: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let s = s.trim_matches('-').to_string();
+    if s.is_empty() || s == "cli" || s == "unknown" {
+        String::new()
+    } else {
+        s.chars().take(48).collect()
+    }
+}
+
+fn mint_guest_alias(conn: &Connection, suggest: Option<&str>) -> String {
+    if let Some(raw) = suggest {
+        let base = sanitize_guest_alias(raw);
+        if !base.is_empty() {
+            if !peer_exists(conn, GUEST_TEAM, &base) {
+                return base;
+            }
+            // live guest with this name: reclaim / refresh the same mailbox
+            if peer_is_ephemeral(conn, GUEST_TEAM, &base) {
+                return base;
+            }
+            for n in 2..1000 {
+                let cand = format!("{}-{}", base, n);
+                if !peer_exists(conn, GUEST_TEAM, &cand) {
+                    return cand;
+                }
+            }
+        }
+    }
+    // server-assigned; short_id is 8 hex chars
+    for _ in 0..32 {
+        let cand = format!("g-{}", short_id());
+        if !peer_exists(conn, GUEST_TEAM, &cand) {
+            return cand;
+        }
+    }
+    format!("g-{}", now_ms())
+}
+
+// drop expired guest peers + their cursors; leave message history alone
+fn expire_guests(conn: &Connection) -> rusqlite::Result<u64> {
+    let now = now_ms();
+    let expired: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT team, alias FROM peers              WHERE ephemeral != 0 AND expires_at IS NOT NULL AND expires_at < ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![now], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        rows
+    };
+    let mut n = 0u64;
+    for (t, a) in expired {
+        n += conn.execute(
+            "DELETE FROM peers WHERE team=?1 AND alias=?2",
+            params![t, a],
+        )? as u64;
+        let _ = conn.execute(
+            "DELETE FROM cursors WHERE team=?1 AND alias=?2",
+            params![t, a],
+        );
+        // clear flag file if present
+        let fp = flag_path(&t, &a);
+        let _ = fs::remove_file(fp);
+    }
+    Ok(n)
+}
+
+fn guest_doorbell_cmd(alias: &str) -> String {
+    format!("agent-bus doorbell --team {} --as {}", GUEST_TEAM, alias)
+}
+
+// claim an ephemeral tmp/<alias> mailbox. rebinds only via MCP serve after ok.
+// refuse when the process already has a durable boot identity.
+fn tool_guest(
+    conn: &Connection,
+    boot_team: &str,
+    boot_alias: &str,
+    args: &Value,
+) -> rusqlite::Result<Value> {
+    let _ = expire_guests(conn);
+
+    if !is_claimable_boot_identity(boot_team, boot_alias) {
+        return Ok(json!({
+            "ok": false,
+            "error": format!(
+                "guest claim refused: boot identity '{}/{}' is durable — refuse to rebind a project mailbox to tmp/",
+                boot_team, boot_alias
+            ),
+            "boot": format!("{}/{}", boot_team, boot_alias),
+        }));
+    }
+
+    let ttl_hours = args["ttl"]
+        .as_i64()
+        .or_else(|| args["ttl_hours"].as_i64())
+        .unwrap_or(DEFAULT_GUEST_TTL_HOURS)
+        .clamp(1, MAX_GUEST_TTL_HOURS);
+    let expires_at = now_ms() + ttl_hours * 3_600_000;
+
+    let suggest = args["as"]
+        .as_str()
+        .or_else(|| args["alias"].as_str())
+        .filter(|s| !s.is_empty());
+
+    // refresh path: already on a live guest identity in this process and no new suggestion
+    let alias = if is_guest_team(boot_team)
+        && !boot_alias.is_empty()
+        && peer_exists(conn, boot_team, boot_alias)
+        && suggest.is_none()
+    {
+        boot_alias.to_string()
+    } else {
+        mint_guest_alias(conn, suggest)
+    };
+
+    let card = args["card"].as_str().unwrap_or("ephemeral session; do not rely on long presence");
+    ensure_team(conn, GUEST_TEAM)?;
+    conn.execute(
+        "INSERT INTO peers(team, alias, card, last_seen, ephemeral, expires_at)          VALUES(?1, ?2, ?3, ?4, 1, ?5)          ON CONFLICT(team, alias) DO UPDATE SET            card=COALESCE(?3, peers.card), last_seen=?4, ephemeral=1, expires_at=?5",
+        params![GUEST_TEAM, alias, card, now_ms(), expires_at],
+    )?;
+
+    Ok(json!({
+        "ok": true,
+        "ephemeral": true,
+        "team": GUEST_TEAM,
+        "alias": alias,
+        "id": format!("{}/{}", GUEST_TEAM, alias),
+        "expires_at": expires_at,
+        "ttl_hours": ttl_hours,
+        "doorbell": guest_doorbell_cmd(&alias),
+        "exports": format!("export AGENT_BUS_TEAM={} AGENT_BUS_ALIAS={}", GUEST_TEAM, alias),
+        "note": "claim first, then poll, then arm the doorbell command above; guests must address durable peers as team/alias",
+    }))
 }
 fn open_db() -> Connection {
     fs::create_dir_all(bus_home()).ok();
@@ -274,7 +466,51 @@ fn tool_send(conn: &Connection, team: &str, alias: &str, args: &Value) -> rusqli
         Some(s) => s,
         None => return Ok(json!({"ok": false, "error": "missing 'to'"})),
     };
+    let sender_guest = peer_is_ephemeral(conn, team, alias) || is_guest_team(team);
+    if sender_guest {
+        // broadcasts never from guests
+        if to == "all" || to == "*" || to == "everyone" || to.starts_with("team:") {
+            return Ok(json!({
+                "ok": false,
+                "error": "guests cannot broadcast; send a direct team/alias message to a durable peer",
+            }));
+        }
+        // bare alias resolves to tmp/<alias> — always require full team/alias
+        if !to.contains('/') {
+            return Ok(json!({
+                "ok": false,
+                "error": format!(
+                    "guests must use full team/alias addressing (got '{}') — bare aliases resolve under tmp/",
+                    to
+                ),
+            }));
+        }
+    }
     let (rt, ra) = resolve_to(to, team);
+    if sender_guest {
+        if ra == "*" {
+            return Ok(json!({
+                "ok": false,
+                "error": "guests cannot broadcast; send a direct team/alias message to a durable peer",
+            }));
+        }
+        if is_guest_team(&rt) || peer_is_ephemeral(conn, &rt, &ra) {
+            return Ok(json!({
+                "ok": false,
+                "error": "guests cannot message other guests — only durable registered peers",
+            }));
+        }
+        if !peer_exists(conn, &rt, &ra) {
+            return Ok(json!({
+                "ok": false,
+                "error": format!(
+                    "no durable peer '{}/{}' is registered — guests may only send to existing agent-bus mailboxes",
+                    rt, ra
+                ),
+                "known_peers": all_peer_ids(conn).into_iter().filter(|id| !id.starts_with("tmp/")).collect::<Vec<_>>(),
+            }));
+        }
+    }
     let body  = args["body"].as_str().unwrap_or("");
     let mtype = args["type"].as_str().unwrap_or("message");
     let state = args["state"].as_str().map(|s| s.to_string()).unwrap_or_else(|| {
@@ -504,6 +740,18 @@ fn tool_tasks(conn: &Connection, team: &str, alias: &str, args: &Value) -> rusql
 }
 
 fn tool_prune(conn: &Connection, args: &Value) -> rusqlite::Result<Value> {
+    let guests_only = args["guests"].as_bool().unwrap_or(false);
+    if guests_only {
+        // force-expire: treat all guests as past TTL, or only those already expired
+        if args["all"].as_bool().unwrap_or(false) {
+            conn.execute(
+                "UPDATE peers SET expires_at=0 WHERE ephemeral != 0 OR team=?1",
+                params![GUEST_TEAM],
+            )?;
+        }
+        let n = expire_guests(conn)?;
+        return Ok(json!({"ok": true, "deleted_guests": n, "guests": true}));
+    }
     let days   = args["days"].as_i64().unwrap_or(30).max(1);
     let cutoff = now_ms() - days * 86_400_000;
     let n = conn.execute("DELETE FROM messages WHERE created_at < ?1", params![cutoff])?;
@@ -511,7 +759,8 @@ fn tool_prune(conn: &Connection, args: &Value) -> rusqlite::Result<Value> {
         "DELETE FROM receipts WHERE message_id NOT IN (SELECT id FROM messages)",
         [],
     )?;
-    Ok(json!({"ok": true, "deleted": n, "days": days}))
+    let gone = expire_guests(conn).unwrap_or(0);
+    Ok(json!({"ok": true, "deleted": n, "days": days, "deleted_guests": gone}))
 }
 
 // the identity a repo's .mcp.json configures the agent-bus server to run as
@@ -671,7 +920,9 @@ fn tool_sync(conn: &Connection, fix: bool) -> rusqlite::Result<Value> {
     }
 
     let (mut failed, mut pruned) = (0u64, 0u64);
+    let mut expired_guests = 0u64;
     if fix {
+        expired_guests = expire_guests(conn).unwrap_or(0);
         for o in &orphans {
             // append a terminal 'failed' back to the sender so they stop waiting
             conn.execute(
@@ -704,6 +955,7 @@ fn tool_sync(conn: &Connection, fix: bool) -> rusqlite::Result<Value> {
         "ok": true, "fixed": fix,
         "orphaned_tasks": orphans_out, "dead_cursors": dead,
         "failed_tasks": failed, "pruned_cursors": pruned,
+        "expired_guests": expired_guests,
     }))
 }
 
@@ -754,6 +1006,9 @@ fn tool_peers(conn: &Connection, my_team: &str, args: &Value) -> rusqlite::Resul
                 "card":      card,
                 "last_seen": ls,
             });
+            if is_guest_team(&t) || peer_is_ephemeral(conn, &t, &a) {
+                obj["ephemeral"] = json!(true);
+            }
             if show_unread {
                 // mirror the flag/poll watermark, not receipts (see unread_count)
                 obj["unread"] = json!(unread_count(conn, &t, &a));
@@ -891,6 +1146,9 @@ fn list_aliases(conn: &Connection, team: &str) -> Vec<String> {
 
 fn call_tool(conn: &Connection, team: &str, alias: &str, name: &str, args: &Value) -> Value {
     let r: rusqlite::Result<Value> = match name {
+        "guest"             => tool_guest(conn, team, alias, args),
+        "register" if args["ephemeral"].as_bool().unwrap_or(false)
+                            => tool_guest(conn, team, alias, args),
         "register"          => tool_register(conn, team, alias, args),
         "send"              => tool_send(conn, team, alias, args),
         "poll"              => tool_poll(conn, team, alias),
@@ -1038,17 +1296,41 @@ fn emit(cmd: &str, v: &Value, flags: &HashMap<String, String>) {
             println!("● renamed team '{}' → '{}'{}", v["from"].as_str().unwrap_or("?"), v["to"].as_str().unwrap_or("?"), tail);
         }
         "register" => println!("● registered {}", v["id"].as_str().unwrap_or("?")),
+        "guest" => {
+            if v["ok"].as_bool().unwrap_or(false) {
+                println!("● claimed guest {}", v["id"].as_str().unwrap_or("?"));
+                if let Some(e) = v["exports"].as_str() { println!("  {}", e); }
+                if let Some(d) = v["doorbell"].as_str() { println!("  doorbell: {}", d); }
+                if let Some(n) = v["note"].as_str() { println!("  note: {}", n); }
+            } else {
+                println!("✗ guest claim failed: {}", v["error"].as_str().unwrap_or("?"));
+            }
+        }
         "unregister" => {
             let id = v["id"].as_str().unwrap_or("?");
             if v["removed"].as_bool().unwrap_or(false) { println!("● removed {}", id); }
             else                                       { println!("○ {} was not registered", id); }
         }
-        "prune" => println!(
-            "● pruned {} message{} older than {}d",
-            v["deleted"].as_i64().unwrap_or(0),
-            plural(v["deleted"].as_i64().unwrap_or(0) as usize),
-            v["days"].as_i64().unwrap_or(0)
-        ),
+        "prune" => {
+            if v["guests"].as_bool().unwrap_or(false) {
+                println!(
+                    "● pruned {} expired guest{}",
+                    v["deleted_guests"].as_i64().unwrap_or(0),
+                    plural(v["deleted_guests"].as_i64().unwrap_or(0) as usize)
+                );
+            } else {
+                println!(
+                    "● pruned {} message{} older than {}d",
+                    v["deleted"].as_i64().unwrap_or(0),
+                    plural(v["deleted"].as_i64().unwrap_or(0) as usize),
+                    v["days"].as_i64().unwrap_or(0)
+                );
+                let g = v["deleted_guests"].as_i64().unwrap_or(0);
+                if g > 0 {
+                    println!("  (+{} expired guest{})", g, plural(g as usize));
+                }
+            }
+        }
         "peers" => {
             let peers = v["peers"].as_array().cloned().unwrap_or_default();
             if peers.is_empty() { println!("○ no peers registered"); return; }
@@ -1063,6 +1345,9 @@ fn emit(cmd: &str, v: &Value, flags: &HashMap<String, String>) {
                     ago(p["last_seen"].as_i64().unwrap_or(0)),
                     w = w
                 );
+                if p["ephemeral"].as_bool().unwrap_or(false) {
+                    line.push_str("  ·  guest");
+                }
                 if let Some(u) = p["unread"].as_i64() {
                     if u > 0 { line.push_str(&format!("  ·  {} unread", u)); }
                 }
@@ -1098,8 +1383,23 @@ fn tools_list() -> Value {
     json!([
         {
             "name": "register",
-            "description": "Register/refresh THIS agent in the bus. Call once at session start, then immediately call poll to drain backlog.",
-            "inputSchema": {"type":"object","properties":{"card":{"type":"string","description":"capability blurb (Agent Card)"}}}
+            "description": "Register/refresh THIS agent in the bus. Call once at session start, then immediately call poll to drain backlog. Set ephemeral=true to claim a tmp/ guest identity instead (only when boot identity is default/unknown or default/cli).",
+            "inputSchema": {"type":"object","properties":{
+                "card": {"type":"string","description":"capability blurb (Agent Card)"},
+                "ephemeral": {"type":"boolean","description":"if true, claim a tmp/ guest mailbox (same as the guest tool)"},
+                "as": {"type":"string","description":"optional guest alias suggestion when ephemeral=true"},
+                "ttl": {"type":"integer","description":"guest TTL hours when ephemeral=true (default 4, max 168)"}
+            }}
+        },
+        {
+            "name": "guest",
+            "description": "Claim an ephemeral tmp/<alias> mailbox for this session. Only when boot identity is default/unknown, default/cli, or already tmp/*. Rebinds the MCP process identity on success. Guests may DM durable peers with full team/alias addressing; no broadcast, no guest-to-guest. Returns doorbell command + shell exports.",
+            "inputSchema": {"type":"object","properties":{
+                "card": {"type":"string","description":"capability blurb"},
+                "as": {"type":"string","description":"optional alias suggestion (server uniques on conflict)"},
+                "alias": {"type":"string","description":"alias for 'as'"},
+                "ttl": {"type":"integer","description":"TTL hours (default 4, max 168)"}
+            }}
         },
         {
             "name": "send",
@@ -1146,9 +1446,11 @@ fn tools_list() -> Value {
         },
         {
             "name": "prune",
-            "description": "Delete messages older than N days (default 30). Returns count deleted.",
+            "description": "Delete messages older than N days (default 30). Also drops expired guest peers. Pass guests=true to only prune guests (all=true force-expires every guest).",
             "inputSchema": {"type":"object","properties":{
-                "days": {"type":"integer","description":"messages older than this many days are deleted"}
+                "days": {"type":"integer","description":"messages older than this many days are deleted"},
+                "guests": {"type":"boolean","description":"if true, only expire guest peers"},
+                "all": {"type":"boolean","description":"with guests=true, force-expire every guest"}
             }}
         },
         {
@@ -1163,7 +1465,8 @@ fn tools_list() -> Value {
 }
 
 // ---------------------------------------------------------------- MCP stdio server
-fn handle(conn: &Connection, team: &str, alias: &str, req: &Value) -> Option<Value> {
+// team/alias are process-local and may rebind after a successful guest claim.
+fn handle(conn: &Connection, team: &mut String, alias: &mut String, req: &Value) -> Option<Value> {
     let method = req["method"].as_str().unwrap_or("");
     let id     = req.get("id").cloned();
     let params = &req["params"];
@@ -1183,6 +1486,16 @@ fn handle(conn: &Connection, team: &str, alias: &str, req: &Value) -> Option<Val
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             let out  = call_tool(conn, team, alias, name, &args);
+            // successful guest claim rebinds this MCP process identity
+            let is_guest_claim = name == "guest"
+                || (name == "register" && args["ephemeral"].as_bool().unwrap_or(false));
+            if is_guest_claim && out["ok"].as_bool().unwrap_or(false) {
+                if let (Some(t), Some(a)) = (out["team"].as_str(), out["alias"].as_str()) {
+                    *team = t.to_string();
+                    *alias = a.to_string();
+                    eprintln!("[agent-bus] guest claim rebind -> {}/{}", team, alias);
+                }
+            }
             let is_err = !out["ok"].as_bool().unwrap_or(true);
             Some(json!({"jsonrpc":"2.0","id":id,"result":{
                 "content": [{"type":"text","text":out.to_string()}],
@@ -1200,7 +1513,8 @@ fn handle(conn: &Connection, team: &str, alias: &str, req: &Value) -> Option<Val
 }
 
 fn serve() {
-    let (team, alias) = (team_env(), alias_env());
+    let mut team = team_env();
+    let mut alias = alias_env();
     let conn = open_db();
     eprintln!("[agent-bus] serve {}/{} db={}", team, alias, db_path().display());
     let stdin = io::stdin();
@@ -1216,7 +1530,7 @@ fn serve() {
             Ok(v)  => v,
             Err(_) => continue,
         };
-        if let Some(resp) = handle(&conn, &team, &alias, &req) {
+        if let Some(resp) = handle(&conn, &mut team, &mut alias, &req) {
             let _ = writeln!(out, "{}", resp);
             let _ = out.flush();
         }
@@ -1305,10 +1619,50 @@ fn cli_peers(flags: &HashMap<String, String>) {
     if flags.get("unread").is_some()     { args["unread"] = json!(true); }
     emit("peers", &call_tool(&conn, &cli_team(flags), "cli", "peers", &args), flags);
 }
+fn cli_guest(flags: &HashMap<String, String>) {
+    let conn = open_db();
+    let mut args = json!({});
+    if let Some(c) = flags.get("card") { args["card"] = json!(c); }
+    // --as / --alias is the guest mailbox suggestion, NOT the boot identity
+    if let Some(a) = flags.get("as").or_else(|| flags.get("alias")) { args["as"] = json!(a); }
+    if let Some(t) = flags.get("ttl") {
+        if let Ok(n) = t.parse::<i64>() { args["ttl"] = json!(n); }
+    }
+    // boot: env, then cwd durable evidence, else default/cli. never reuse --as as boot
+    // (that flag names the guest). durable cwd correctly refuses via tool_guest.
+    let boot_team = std::env::var("AGENT_BUS_TEAM")
+        .ok()
+        .or_else(|| cwd_identity().map(|(t, _)| t))
+        .unwrap_or_else(|| "default".into());
+    let boot_alias = std::env::var("AGENT_BUS_ALIAS")
+        .ok()
+        .or_else(|| cwd_identity().map(|(_, a)| a))
+        .unwrap_or_else(|| "cli".into());
+    emit("guest", &call_tool(&conn, &boot_team, &boot_alias, "guest", &args), flags);
+}
+
 fn cli_register(flags: &HashMap<String, String>) {
     let conn = open_db();
     let mut args = json!({});
     if let Some(v) = flags.get("card") { args["card"] = json!(v); }
+    if flags.contains_key("ephemeral") {
+        args["ephemeral"] = json!(true);
+        // --as is the guest suggestion; boot comes from env/cwd, not --as
+        if let Some(a) = flags.get("as").or_else(|| flags.get("alias")) { args["as"] = json!(a); }
+        if let Some(t) = flags.get("ttl") {
+            if let Ok(n) = t.parse::<i64>() { args["ttl"] = json!(n); }
+        }
+        let boot_team = std::env::var("AGENT_BUS_TEAM")
+            .ok()
+            .or_else(|| cwd_identity().map(|(t, _)| t))
+            .unwrap_or_else(|| "default".into());
+        let boot_alias = std::env::var("AGENT_BUS_ALIAS")
+            .ok()
+            .or_else(|| cwd_identity().map(|(_, a)| a))
+            .unwrap_or_else(|| "cli".into());
+        emit("register", &call_tool(&conn, &boot_team, &boot_alias, "register", &args), flags);
+        return;
+    }
     emit("register", &call_tool(&conn, &cli_team(flags), &cli_alias(flags), "register", &args), flags);
 }
 
@@ -1412,11 +1766,16 @@ fn cli_teams(flags: &HashMap<String, String>) {
 fn cli_prune(flags: &HashMap<String, String>) {
     let conn = open_db();
     let mut args = json!({});
-    if let Some(v) = flags.get("days") {
-        if let Ok(n) = v.parse::<i64>() { args["days"] = json!(n); }
+    if flags.contains_key("guests") {
+        args["guests"] = json!(true);
+        if flags.contains_key("all") { args["all"] = json!(true); }
+    } else if let Some(d) = flags.get("days") {
+        if let Ok(n) = d.parse::<i64>() { args["days"] = json!(n); }
     }
     emit("prune", &call_tool(&conn, &cli_team(flags), &cli_alias(flags), "prune", &args), flags);
 }
+
+
 fn need_pos(cmd: &str, pos: &[String], usage: &str) -> String {
     match pos.first() {
         Some(p) => p.clone(),
@@ -1721,10 +2080,12 @@ fn cli_doctor(flags: &HashMap<String, String>) {
         let conn = open_db();
         let stale_threshold = now_ms() - 3_600_000;
         let mut stmt = conn
-            .prepare("SELECT team || '/' || alias FROM peers WHERE last_seen < ?1")
+            .prepare(
+                "SELECT team || '/' || alias FROM peers                  WHERE last_seen < ?1 AND team != ?2 AND IFNULL(ephemeral,0)=0",
+            )
             .unwrap();
         let stale: Vec<String> = stmt
-            .query_map(params![stale_threshold], |r| r.get::<_, String>(0))
+            .query_map(params![stale_threshold, GUEST_TEAM], |r| r.get::<_, String>(0))
             .unwrap()
             .flatten()
             .collect();
@@ -2394,7 +2755,7 @@ Monitor(persistent:true, timeout_ms:3600000, command: agent-bus doorbell --team 
 // positionals used to be silently discarded, so `unregister foo --team t` dropped
 // `foo` and fell back to the caller's own alias — deleting the wrong peer
 // valueless flags must not swallow the next token, or `--unread foo` eats `foo`
-const BOOL_FLAGS: &[&str] = &["json", "help", "h", "unread", "no-interactive", "force", "fix", "quiet", "repair", "once", "all"];
+const BOOL_FLAGS: &[&str] = &["json", "help", "h", "unread", "no-interactive", "force", "fix", "quiet", "repair", "once", "all", "guests", "ephemeral"];
 
 fn parse_args(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
     let mut m = HashMap::new();
@@ -2441,13 +2802,14 @@ fn spec(cmd: &str) -> (&'static [&'static str], usize) {
         "poll"                 => (&["team", "as"], 0),
         "peek" | "history"     => (&["limit", "task-id", "since-id", "team", "as"], 0),
         "tasks"                => (&["filter", "limit", "team", "as"], 0),
-        "prune"                => (&["days", "team", "as"], 0),
+        "prune"                => (&["days", "team", "as", "guests", "all"], 0),
         "peers" | "roster"     => (&["team", "unread"], 0),
         "teams"                => (&["no-interactive"], 0),
         "create-team"          => (&[], 1),          // positional: name
         "delete-team"          => (&["force"], 1),   // positional: name
         "rename-team"          => (&[], 2),          // positionals: old new
-        "register"             => (&["card", "team", "as"], 0),
+        "register"             => (&["card", "team", "as", "ephemeral", "ttl"], 0),
+        "guest"                => (&["card", "as", "alias", "ttl"], 0),
         "unregister"           => (&["team", "as", "alias"], 1), // positional: alias or team/alias
         "whoami"               => (&["team", "as"], 0),
         "doctor"               => (&["team", "as", "quiet", "repair"], 0),
@@ -2469,14 +2831,15 @@ fn usage() -> &'static str {
      peek [--limit N] [--task-id id] [--since-id N]   read-only; no cursor advance\n\
      tasks [--filter open|all|mine|for-me] [--limit N]   bounded rollup (default open, 50)\n\
      doorbell [--team t --as a] [--once]   self-healing inbound-mail watcher\n\
-     prune [--days N]\n\
+     prune [--days N] [--guests [--all]]\n\
      peers [--team t|*] [--unread]\n\
      roster                        alias for peers (my team)\n\
      teams [--no-interactive]      list teams; on a tty, offers to create one\n\
      create-team <name>            create an empty team\n\
      rename-team <old> <new>       rename a team (cascades across the bus)\n\
      delete-team <name> [--force]  delete a team; --force also removes its agents\n\
-     register [--card ..] [--team t] [--as a]\n\
+     register [--card ..] [--team t] [--as a] [--ephemeral] [--ttl hours]\n\
+     guest [--card ..] [--as slug] [--ttl hours]   claim ephemeral tmp/ mailbox\n\
      unregister [alias | team/alias]    defaults to self if no target given\n\
      whoami\n\
      doctor [--team t --as a] [--quiet] [--repair]   per-agent health + config drift;\n\
@@ -2512,7 +2875,7 @@ fn main() {
     const COMMANDS: &[&str] = &[
         "", "setup", "serve", "install", "send", "poll", "peek", "history", "tasks",
         "prune", "peers", "roster", "teams", "create-team", "delete-team",
-        "rename-team", "register", "unregister", "whoami",
+        "rename-team", "register", "guest", "unregister", "whoami",
         "doctor", "doorbell", "install-hook", "sync", "version", "--version", "-V",
     ];
     if !COMMANDS.contains(&cmd) {
@@ -2541,6 +2904,7 @@ fn main() {
         "delete-team"         => cli_delete_team(&flags, &pos),
         "rename-team"         => cli_rename_team(&flags, &pos),
         "register"            => cli_register(&flags),
+        "guest"               => cli_guest(&flags),
         "unregister"          => cli_unregister(&flags, &pos),
         "whoami"              => cli_whoami(&flags),
         "doctor"              => cli_doctor(&flags),
@@ -3521,10 +3885,232 @@ mod tests {
     #[test]
     fn mcp_handshake() {
         let c = mem();
-        let resp = handle(&c, "astrub", "sync", &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})).unwrap();
+        let mut team = "astrub".to_string();
+        let mut alias = "sync".to_string();
+        let resp = handle(&c, &mut team, &mut alias, &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})).unwrap();
         assert_eq!(resp["result"]["serverInfo"]["name"], "agent-bus");
-        assert!(handle(&c, "astrub", "sync", &json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none());
-        let resp = handle(&c, "astrub", "sync", &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
-        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 8);
+        assert!(handle(&c, &mut team, &mut alias, &json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none());
+        let resp = handle(&c, &mut team, &mut alias, &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
+        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn guest_claim_from_default_ok() {
+        let c = mem();
+        let r = tool_guest(&c, "default", "cli", &json!({"card":"tmp session"})).unwrap();
+        assert!(r["ok"].as_bool().unwrap(), "{}", r);
+        assert_eq!(r["team"], "tmp");
+        assert!(r["ephemeral"].as_bool().unwrap());
+        assert!(r["alias"].as_str().unwrap().starts_with("g-"));
+        assert!(r["doorbell"].as_str().unwrap().contains("doorbell --team tmp --as "));
+        assert!(peer_exists(&c, "tmp", r["alias"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn guest_claim_from_durable_refused() {
+        let c = mem();
+        tool_register(&c, "sergen", "myideas", &json!({})).unwrap();
+        let r = tool_guest(&c, "sergen", "myideas", &json!({})).unwrap();
+        assert!(!r["ok"].as_bool().unwrap());
+        assert!(r["error"].as_str().unwrap().contains("durable"));
+    }
+
+    #[test]
+    fn guest_send_policy_and_roundtrip() {
+        let c = mem();
+        tool_register(&c, "sergen", "myideas", &json!({"card":"ideas"})).unwrap();
+        let g = tool_guest(&c, "default", "unknown", &json!({"as":"cc-34","card":"idea capture"})).unwrap();
+        assert!(g["ok"].as_bool().unwrap(), "{}", g);
+        let ga = g["alias"].as_str().unwrap().to_string();
+        assert_eq!(ga, "cc-34");
+
+        let s = tool_send(&c, "tmp", &ga, &json!({
+            "to":"sergen/myideas","body":"please capture this idea"
+        })).unwrap();
+        assert!(s["ok"].as_bool().unwrap(), "{}", s);
+        assert_eq!(s["from"], format!("tmp/{}", ga));
+        assert_eq!(s["to"], "sergen/myideas");
+
+        let bad = tool_send(&c, "tmp", &ga, &json!({"to":"myideas","body":"x"})).unwrap();
+        assert!(!bad["ok"].as_bool().unwrap());
+        assert!(bad["error"].as_str().unwrap().contains("full team/alias"));
+
+        for to in ["*", "all", "team:sergen", "everyone"] {
+            let b = tool_send(&c, "tmp", &ga, &json!({"to":to,"body":"x"})).unwrap();
+            assert!(!b["ok"].as_bool().unwrap(), "broadcast {} should fail", to);
+        }
+
+        let u = tool_send(&c, "tmp", &ga, &json!({"to":"sergen/nope","body":"x"})).unwrap();
+        assert!(!u["ok"].as_bool().unwrap());
+
+        let g2 = tool_guest(&c, "default", "cli", &json!({"as":"other"})).unwrap();
+        let ga2 = g2["alias"].as_str().unwrap().to_string();
+        let gg = tool_send(&c, "tmp", &ga, &json!({
+            "to": format!("tmp/{}", ga2), "body":"nope"
+        })).unwrap();
+        assert!(!gg["ok"].as_bool().unwrap());
+
+        tool_send(&c, "sergen", "myideas", &json!({
+            "to": format!("tmp/{}", ga), "body":"captured"
+        })).unwrap();
+        let p = tool_poll(&c, "tmp", &ga).unwrap();
+        assert_eq!(p["identity"], format!("tmp/{}", ga));
+        assert_eq!(p["count"], 1);
+        assert_eq!(p["messages"][0]["from"], "sergen/myideas");
+        assert_eq!(p["messages"][0]["body"], "captured");
+
+        let p2 = tool_poll(&c, "sergen", "myideas").unwrap();
+        assert_eq!(p2["count"], 1);
+        assert_eq!(p2["messages"][0]["from"], format!("tmp/{}", ga));
+    }
+
+    #[test]
+    fn peers_marks_ephemeral_and_expire_guests() {
+        let c = mem();
+        tool_register(&c, "sergen", "myideas", &json!({})).unwrap();
+        let g = tool_guest(&c, "default", "cli", &json!({"as":"stale-guest"})).unwrap();
+        let ga = g["alias"].as_str().unwrap().to_string();
+
+        let r = tool_peers(&c, "tmp", &json!({"team":"*"})).unwrap();
+        let guest = r["peers"].as_array().unwrap().iter()
+            .find(|p| p["alias"] == ga).unwrap();
+        assert!(guest["ephemeral"].as_bool().unwrap());
+
+        c.execute(
+            "UPDATE peers SET last_seen=1, expires_at=1 WHERE team='tmp' AND alias=?1",
+            params![ga],
+        ).unwrap();
+        assert_eq!(expire_guests(&c).unwrap(), 1);
+        assert!(!peer_exists(&c, "tmp", &ga));
+    }
+
+    #[test]
+    fn guest_suggested_alias_reclaim_and_mint() {
+        let c = mem();
+        let a = tool_guest(&c, "default", "cli", &json!({"as":"camper"})).unwrap();
+        assert_eq!(a["alias"], "camper");
+        // still-live guest with same suggestion refreshes the same mailbox
+        let b = tool_guest(&c, "default", "cli", &json!({"as":"camper"})).unwrap();
+        assert_eq!(b["alias"], "camper");
+        c.execute("UPDATE peers SET expires_at=1 WHERE team='tmp' AND alias='camper'", []).unwrap();
+        expire_guests(&c).unwrap();
+        let c1 = tool_guest(&c, "default", "cli", &json!({"as":"camper"})).unwrap();
+        assert_eq!(c1["alias"], "camper");
+        // live guest reclaims; non-ephemeral collision suffixes
+        assert_eq!(mint_guest_alias(&c, Some("camper")), "camper");
+        c.execute("UPDATE peers SET ephemeral=0 WHERE team='tmp' AND alias='camper'", []).unwrap();
+        assert_eq!(mint_guest_alias(&c, Some("camper")), "camper-2");
+    }
+
+    #[test]
+    fn mcp_guest_rebinds_process_identity() {
+        let c = mem();
+        tool_register(&c, "sergen", "myideas", &json!({})).unwrap();
+        let mut team = "default".to_string();
+        let mut alias = "cli".to_string();
+        let req = json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"guest","arguments":{"as":"rebind-me","card":"x"}}
+        });
+        let resp = handle(&c, &mut team, &mut alias, &req).unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let out: Value = serde_json::from_str(text).unwrap();
+        assert!(out["ok"].as_bool().unwrap(), "{}", out);
+        assert_eq!(team, "tmp");
+        assert_eq!(alias, "rebind-me");
+
+        let s = call_tool(&c, &team, &alias, "send", &json!({
+            "to":"sergen/myideas","body":"after rebind"
+        }));
+        assert!(s["ok"].as_bool().unwrap(), "{}", s);
+        assert_eq!(s["from"], "tmp/rebind-me");
+
+        let mut t2 = "sergen".to_string();
+        let mut a2 = "myideas".to_string();
+        let req2 = json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"guest","arguments":{}}
+        });
+        let resp2 = handle(&c, &mut t2, &mut a2, &req2).unwrap();
+        let text2 = resp2["result"]["content"][0]["text"].as_str().unwrap();
+        let out2: Value = serde_json::from_str(text2).unwrap();
+        assert!(!out2["ok"].as_bool().unwrap());
+        assert_eq!(t2, "sergen");
+        assert_eq!(a2, "myideas");
+    }
+
+    #[test]
+    fn register_ephemeral_flag_routes_to_guest() {
+        let c = mem();
+        let r = call_tool(&c, "default", "unknown", "register", &json!({
+            "ephemeral": true, "as": "via-register", "card": "x"
+        }));
+        assert!(r["ok"].as_bool().unwrap(), "{}", r);
+        assert_eq!(r["id"], "tmp/via-register");
+        assert!(r["ephemeral"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn guest_monkey_claim_send_poll_expire() {
+        let c = mem();
+        tool_register(&c, "sergen", "myideas", &json!({"card":"ideas"})).unwrap();
+        let mut aliases = Vec::new();
+        for i in 0..25 {
+            let g = tool_guest(&c, "default", "cli", &json!({
+                "as": format!("m{}", i % 7),
+                "card": format!("monkey-{}", i),
+                "ttl": 2
+            })).unwrap();
+            assert!(g["ok"].as_bool().unwrap(), "claim {}: {}", i, g);
+            let ga = g["alias"].as_str().unwrap().to_string();
+            aliases.push(ga.clone());
+
+            let ok = tool_send(&c, "tmp", &ga, &json!({
+                "to":"sergen/myideas",
+                "body": format!("msg-{}-from-{}", i, ga)
+            })).unwrap();
+            assert!(ok["ok"].as_bool().unwrap(), "{}", ok);
+            assert_eq!(ok["from"], format!("tmp/{}", ga));
+
+            assert!(!tool_send(&c, "tmp", &ga, &json!({"to":"*","body":"x"})).unwrap()["ok"].as_bool().unwrap());
+            assert!(!tool_send(&c, "tmp", &ga, &json!({"to":"bare","body":"x"})).unwrap()["ok"].as_bool().unwrap());
+        }
+
+        let inbox = tool_poll(&c, "sergen", "myideas").unwrap();
+        assert_eq!(inbox["count"].as_i64().unwrap(), 25);
+
+        for ga in aliases.iter().take(5) {
+            tool_send(&c, "sergen", "myideas", &json!({
+                "to": format!("tmp/{}", ga), "body": format!("ack-{}", ga)
+            })).unwrap();
+            let p = tool_poll(&c, "tmp", ga).unwrap();
+            assert!(p["count"].as_i64().unwrap() >= 1, "guest {} should see reply", ga);
+        }
+
+        c.execute("UPDATE peers SET expires_at=0 WHERE ephemeral != 0", []).unwrap();
+        let n = expire_guests(&c).unwrap();
+        assert!(n >= 1);
+        let left: i64 = c.query_row(
+            "SELECT COUNT(*) FROM peers WHERE team='tmp'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(left, 0);
+
+        let g = tool_guest(&c, "default", "cli", &json!({"as":"to-prune"})).unwrap();
+        assert!(g["ok"].as_bool().unwrap());
+        let pr = tool_prune(&c, &json!({"guests": true, "all": true})).unwrap();
+        assert!(pr["deleted_guests"].as_i64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn claimable_boot_identity_helpers() {
+        assert!(is_claimable_boot_identity("default", "cli"));
+        assert!(is_claimable_boot_identity("default", "unknown"));
+        assert!(is_claimable_boot_identity("tmp", "g-abc"));
+        assert!(!is_claimable_boot_identity("sergen", "myideas"));
+        assert!(!is_claimable_boot_identity("astrub", "sync"));
+        assert!(is_guest_team("tmp"));
+        assert!(!is_guest_team("sergen"));
     }
 }
