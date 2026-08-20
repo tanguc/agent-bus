@@ -71,6 +71,10 @@ agent-bus install --tool claude --team astrub --alias classic --repo ~/Projects/
 agent-bus install --tool codex   --team astrub --alias codexer     # writes ~/.codex/config.toml
 agent-bus install --tool copilot --team astrub --alias copilot      # prints the snippet
 ```
+
+If the target repo is not inside a git worktree, install still writes `.mcp.json` /
+`CLAUDE.local.md` / `.claude/settings.local.json`, but prints a warning so the user knows to
+exclude them from a future `git init`. `AGENT_BUS_ALLOW_NO_GIT=1` silences for scripts.
 After installing, just **restart that session** — no approval prompt. The installer
 auto-enables the server by adding `"enabledMcpjsonServers": ["agent-bus"]` to the repo's
 `.claude/settings.local.json` (targeted + personal/gitignored). To approve broadly instead,

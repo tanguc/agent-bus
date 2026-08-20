@@ -2387,9 +2387,15 @@ fn validate_install_target(repo: &str) {
 
     match find_git_root(&canon) {
         None => {
-            eprintln!("error: {} is not inside a git repository", canon.display());
-            eprintln!("       (.git not found here or in any parent directory)");
-            std::process::exit(1);
+            // non-git workspace: still install but warn loudly so .mcp.json / CLAUDE.local.md
+            // / .claude/ aren't accidentally committed if the user git-inits this directory
+            // later. AGENT_BUS_ALLOW_NO_GIT=1 silences the warning for scripting.
+            let silent = std::env::var("AGENT_BUS_ALLOW_NO_GIT").ok().as_deref() == Some("1");
+            if !silent {
+                eprintln!("warning: {} is not inside a git repository", canon.display());
+                eprintln!("         (.mcp.json / CLAUDE.local.md / .claude/ will be written here;");
+                eprintln!("          if you `git init` later, exclude them or commit only manually.)");
+            }
         }
         Some(root) if root != canon => {
             println!("note: installing into a subdirectory of the repo at {}", root.display());
@@ -4101,6 +4107,31 @@ mod tests {
         assert!(g["ok"].as_bool().unwrap());
         let pr = tool_prune(&c, &json!({"guests": true, "all": true})).unwrap();
         assert!(pr["deleted_guests"].as_i64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn install_target_outside_git_writes_with_warning() {
+        // non-git workspaces must still be installable — the gate is a warning, not a block.
+        let tmp = std::env::temp_dir().join(format!("ab-no-git-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let exe = exe.to_string_lossy();
+        std::env::set_var("AGENT_BUS_HOME", &tmp);
+        std::env::set_var("AGENT_BUS_DB", tmp.join("bus.db"));
+        std::env::set_var("AGENT_BUS_ALLOW_NO_GIT", "1");
+        install_claude(tmp.to_string_lossy().as_ref(), "sergen", "no-git", &exe);
+        std::env::remove_var("AGENT_BUS_ALLOW_NO_GIT");
+        std::env::remove_var("AGENT_BUS_HOME");
+        std::env::remove_var("AGENT_BUS_DB");
+        assert!(tmp.join(".mcp.json").exists(), ".mcp.json should be written");
+        assert!(tmp.join("CLAUDE.local.md").exists(), "CLAUDE.local.md should be written");
+        assert!(tmp.join(".claude").join("settings.local.json").exists(), "settings.local.json should be written");
+        let mcp: Value = serde_json::from_str(
+            &fs::read_to_string(tmp.join(".mcp.json")).unwrap()).unwrap();
+        assert_eq!(mcp["mcpServers"]["agent-bus"]["env"]["AGENT_BUS_ALIAS"], "no-git");
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
